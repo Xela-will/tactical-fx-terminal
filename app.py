@@ -114,9 +114,11 @@ timeframe = st.sidebar.selectbox(
 target_rr = st.sidebar.selectbox(
     "Tactical Risk:Reward Profile",
     [1.5, 2.0],
-    index=0,
-    help="1:1.5 hits far more frequently in intraday conditions; 1:2.0 requires wider trend runs."
+    index=0
 )
+
+adx_min = st.sidebar.slider("Chop Filter: Min ADX Velocity", min_value=15, max_value=30, value=20, step=1,
+                           help="Filters out consolidation. Signals only fire when trend velocity exceeds this value.")
 
 st.sidebar.write("---")
 st.sidebar.subheader("Account & Risk Management")
@@ -126,15 +128,17 @@ max_margin_pct = st.sidebar.slider("Max Collateral Allowed (%)", min_value=5, ma
 
 st.sidebar.write("---")
 st.sidebar.subheader("AI Intelligence Layer")
-sidebar_gemini_key = st.sidebar.text_input("Gemini API Key (Optional)", type="password", help="Leave blank if stored in Streamlit Secrets")
+sidebar_gemini_key = st.sidebar.text_input("Gemini API Key (Optional)", type="password")
 
 st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Feed: Active")
 
-# 5. Session Liquidity Filters (EST Timezone)
+# 5. Session Liquidity Filters (With 1D Bypass)
 est_tz = pytz.timezone("US/Eastern")
 now_est = datetime.now(est_tz)
 
-def evaluate_session_timing(ticker_label, dt):
+def evaluate_session_timing(ticker_label, dt, tf_label):
+    if tf_label == "1d":
+        return True, "Daily Macro"
     if "BTC" in ticker_label:
         return True, "Crypto 24/7"
     
@@ -149,22 +153,20 @@ def evaluate_session_timing(ticker_label, dt):
     hour_est = dt_est.hour + (dt_est.minute / 60.0)
 
     if any(k in ticker_label for k in ["EUR", "GBP", "CHF"]) and "USD" not in ticker_label and "JPY" not in ticker_label:
-        return (3.0 <= hour_est <= 12.0), "London Core (03:00 - 12:00 EST)"
-    
+        return (3.0 <= hour_est <= 12.0), "London Core"
     if any(k in ticker_label for k in ["USD", "CAD", "GC=F"]):
         active = (8.0 <= hour_est <= 16.3) or (3.0 <= hour_est <= 11.5)
-        return active, "NY / London Overlap (08:00 - 16:30 EST)"
-    
+        return active, "NY / London Overlap"
     if any(k in ticker_label for k in ["JPY", "AUD", "NZD"]):
         active = (hour_est >= 19.0 or hour_est <= 4.0) or (3.0 <= hour_est <= 11.5)
-        return active, "Tokyo / Asian Active"
+        return active, "Tokyo Active"
         
     return True, "Open Liquidity"
 
 def is_session_active(ticker_label):
-    return evaluate_session_timing(ticker_label, now_est)
+    return evaluate_session_timing(ticker_label, now_est, timeframe)
 
-# 6. Data Ingestion & Technical Calculations
+# 6. Technical Calculations + ADX Momentum Filter
 period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
 fetch_period = period_map.get(timeframe, "10d")
 
@@ -172,32 +174,51 @@ def process_indicators(df):
     if df is None or len(df) < 55:
         return None
     df = df.copy()
+    
+    # EMAs
     df['Midfield_200EMA'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['Tempo_20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
 
-    # Slope check: 200 EMA direction over 5 bars
-    df['EMA200_Slope_Bull'] = df['Midfield_200EMA'] >= df['Midfield_200EMA'].shift(5)
-    df['EMA200_Slope_Bear'] = df['Midfield_200EMA'] <= df['Midfield_200EMA'].shift(5)
-
+    # True Range & ATR
     hl = df['High'] - df['Low']
     hc = (df['High'] - df['Close'].shift()).abs()
     lc = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df['ATR_14'] = tr.rolling(window=14).mean()
 
+    # Directional Movement & ADX (14)
+    up_move = df['High'] - df['High'].shift(1)
+    down_move = df['Low'].shift(1) - df['Low']
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    
+    tr_smooth = tr.rolling(14).mean()
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(14).mean() / tr_smooth)
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(14).mean() / tr_smooth)
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di))
+    df['ADX'] = dx.rolling(14).mean().fillna(0)
+
+    # RSI (14)
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # Balanced pullback rules: trend alignment + clean EMA touch
-    in_possession_bull = (df['Close'] > df['Midfield_200EMA']) & df['EMA200_Slope_Bull']
+    # Slope Filter (Requires measurable angle)
+    slope_diff = df['Midfield_200EMA'] - df['Midfield_200EMA'].shift(5)
+    df['EMA200_Slope_Bull'] = slope_diff > (df['ATR_14'] * 0.05)
+    df['EMA200_Slope_Bear'] = slope_diff < -(df['ATR_14'] * 0.05)
+
+    # Signal Rules
+    has_trend_velocity = df['ADX'] >= adx_min
+
+    in_possession_bull = (df['Close'] > df['Midfield_200EMA']) & df['EMA200_Slope_Bull'] & has_trend_velocity
     pullback_to_box = (df['Low'] <= df['Tempo_20EMA'] * 1.001) & (df['Close'] >= df['Tempo_20EMA'] * 0.997)
     striker_primed_bull = (df['RSI'] >= 38) & (df['RSI'] <= 58)
     df['Striker_Buy'] = in_possession_bull & pullback_to_box & striker_primed_bull
 
-    in_possession_bear = (df['Close'] < df['Midfield_200EMA']) & df['EMA200_Slope_Bear']
+    in_possession_bear = (df['Close'] < df['Midfield_200EMA']) & df['EMA200_Slope_Bear'] & has_trend_velocity
     rally_to_box = (df['High'] >= df['Tempo_20EMA'] * 0.999) & (df['Close'] <= df['Tempo_20EMA'] * 1.003)
     striker_primed_bear = (df['RSI'] >= 42) & (df['RSI'] <= 62)
     df['Striker_Sell'] = in_possession_bear & rally_to_box & striker_primed_bear
@@ -231,7 +252,7 @@ market_data = scan_all_markets(FOREX_ROSTER, timeframe, fetch_period)
 
 # 7. Tactical Radar Scanner
 st.title("Tactical Radar: All-Pitch Scanner")
-st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} (New York Time)")
+st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} (New York Time) | Velocity Gate: ADX $\ge$ {adx_min}")
 
 radar_records = []
 active_buys = []
@@ -266,9 +287,9 @@ for label, df_item in market_data.items():
     radar_records.append({
         "Instrument": label,
         "Signal": status,
-        "Session State": "Active" if session_ok else "Closed / Low Liquidity",
+        "Session State": "Active" if session_ok else "Closed",
         "Price": f"{latest['Close']:.{p_dec}f}",
-        "Possession": "Attacking" if latest['Close'] > latest['Midfield_200EMA'] else "Defending",
+        "ADX Strength": f"{latest['ADX']:.1f}",
         "RSI": f"{latest['RSI']:.1f}",
         f"Stop ({'USD' if is_crypto else 'Pips'})": f"{stop_units:.1f}"
     })
@@ -281,7 +302,7 @@ if active_buys or active_sells:
         alert_msg.append(f"🔴 **LIVE SELL:** {', '.join(active_sells)}")
     st.success(" | ".join(alert_msg))
 else:
-    st.info("🟡 **Radar Clean:** No instruments in strike zone during active market sessions.")
+    st.info(f"🟡 **Radar Clean:** No instruments in strike zone with ADX $\ge$ {adx_min} during active market sessions.")
 
 with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
     radar_df = pd.DataFrame(radar_records)
@@ -370,7 +391,7 @@ st.markdown(f"""
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Live Market Price", price_fmt)
-c2.metric("Possession", "ATTACKING" if in_possession else "DEFENDING", delta="Above 200 EMA" if in_possession else "-Below 200 EMA")
+c2.metric("Trend Velocity (ADX)", f"{latest['ADX']:.1f}", delta="Trending" if latest['ADX'] >= adx_min else "-Chop Zone")
 c3.metric("Defensive Stop", f"{stop_metric:.1f} {metric_label}", f"Target: +{stop_metric * target_rr:.1f} (1:{target_rr})")
 c4.metric("Strict Sizing (OANDA)", sizing_label, f"Margin: ${required_margin:,.0f} ({int(1/margin_rate)}:1)")
 
@@ -383,10 +404,10 @@ if active_buy_signal and session_ok:
     ### 🟢 ACTIVE DIRECTIVE: BUY / LONG SIGNAL
     * **Order Type:** Market Buy
     * **Entry Price:** `{latest['Close']:.{p_dec}f}`
-    * **Initial Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_metric:.1f} {metric_label})
+    * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (+{stop_metric * tp_mult:.1f} {metric_label} | 1:{tp_mult} R:R)
-    * **Defensive Adjustment:** Once price reaches +{stop_metric * 1.2:.1f} {metric_label} (+1.2 R), lock SL to entry.
-    * **Suggested Sizing:** `{sizing_label}`
+    * **Target Trailing:** Lock to breakeven once price reaches +{stop_metric * 1.2:.1f} {metric_label}.
+    * **Tactical Confirmation:** ADX Velocity `{latest['ADX']:.1f}` $\ge$ {adx_min} + Above 200 EMA + Upward Slope.
     """)
 elif active_sell_signal and session_ok:
     sl_price = latest['Close'] + stop_distance_price
@@ -395,28 +416,19 @@ elif active_sell_signal and session_ok:
     ### 🔴 ACTIVE DIRECTIVE: SELL / SHORT SIGNAL
     * **Order Type:** Market Sell
     * **Entry Price:** `{latest['Close']:.{p_dec}f}`
-    * **Initial Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_metric:.1f} {metric_label})
+    * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (-{stop_metric * tp_mult:.1f} {metric_label} | 1:{tp_mult} R:R)
-    * **Defensive Adjustment:** Once price reaches -{stop_metric * 1.2:.1f} {metric_label} (+1.2 R), lock SL to entry.
-    * **Suggested Sizing:** `{sizing_label}`
-    """)
-elif (active_buy_signal or active_sell_signal) and not session_ok:
-    st.warning(f"""
-    ### ⏸️ DIRECTIVE PAUSED: OFF-HOURS / LOW LIQUIDITY
-    * **Technical Setup Met:** Technical pullback setup active on pitch.
-    * **Session Guard:** Blocked because **{selected_label}** trades during **{session_name}**.
-    * **Reason:** Current time ({now_est.strftime('%H:%M EST')}) lacks institutional liquidity.
+    * **Target Trailing:** Lock to breakeven once price reaches -{stop_metric * 1.2:.1f} {metric_label}.
+    * **Tactical Confirmation:** ADX Velocity `{latest['ADX']:.1f}` $\ge$ {adx_min} + Below 200 EMA + Downward Slope.
     """)
 else:
-    dist_to_ema20 = abs(latest['Close'] - latest['Tempo_20EMA']) / pip_scale
     st.info(f"""
     ### 🟡 TACTICAL DIRECTIVE: STAND BY (PATIENT POSSESSION)
-    * **Status:** No qualified trend pullback. Maintain position discipline.
-    * **Tactical Read:** Retest at 20 EMA is {dist_to_ema20:.1f} {metric_label} away at `{latest['Tempo_20EMA']:.{p_dec}f}`. Current RSI: `{latest['RSI']:.1f}`.
+    * **Status:** No qualified setup. Current ADX is `{latest['ADX']:.1f}` (Requires $\ge$ {adx_min} for trending momentum).
     * **Session Status:** {session_name} ({'Active' if session_ok else 'Closed / Low Volume'}).
     """)
 
-# 10. AI Assistant Manager (Persistent Debrief)
+# 10. AI Assistant Manager
 st.write("---")
 if "ai_briefings" not in st.session_state:
     st.session_state.ai_briefings = {}
@@ -449,14 +461,14 @@ with st.expander("🤖 AI Assistant Manager (Tactical Debrief)", expanded=True):
                 - Timeframe: {timeframe}
                 - Current Price: {latest['Close']:.{p_dec}f}
                 - Midfield 200 EMA: {latest['Midfield_200EMA']:.{p_dec}f} ({'Above' if in_possession else 'Below'})
-                - Tempo 20 EMA: {latest['Tempo_20EMA']:.{p_dec}f}
+                - ADX Momentum Velocity: {latest['ADX']:.1f} (Threshold: {adx_min})
                 - RSI: {latest['RSI']:.1f}
                 - ATR Stop Distance: {stop_metric:.1f} {metric_label}
                 - Session: {session_name} ({'Active' if session_ok else 'Illiquid'})
                 - System Directive: {signal_label}
 
                 Provide a sharp, 3-point tactical debrief:
-                1. 🏟️ Pitch & Liquidity Condition (Does current market session support momentum?)
+                1. 🏟️ Pitch & Liquidity Condition (Does current market session and ADX velocity support momentum?)
                 2. ⚽ Tactical Setup Evaluation (Is this a high-quality strike or a false breakout/trap?)
                 3. 🛡️ Defensive Command (Actionable directive on whether to execute, wait, or protect capital)
                 Keep it disciplined, direct, and under 150 words.
@@ -483,14 +495,12 @@ with st.expander("🤖 AI Assistant Manager (Tactical Debrief)", expanded=True):
             except Exception as e:
                 st.error(f"AI connection error: {str(e)}")
         else:
-            spread_risk = "High spread penalty risk" if stop_metric < 12.0 else "Healthy buffer over spread"
-            momentum_state = "Overbought" if latest['RSI'] > 65 else ("Oversold" if latest['RSI'] < 35 else "Balanced momentum")
-            
+            trend_state = "Strong Trend Velocity" if latest['ADX'] >= adx_min else "Flat Rangebound Chop"
             st.session_state.ai_briefings[briefing_key] = {
                 "text": f"""
-                * **🏟️ Liquidity & Pitch Status:** Market session is **{session_name}** ({'Open with institutional backing' if session_ok else 'Illiquid off-hours; high risk of stalled price'}).
-                * **⚽ Momentum & Value:** RSI stands at **{latest['RSI']:.1f}** ({momentum_state}). Price is {'controlling macro midfield above the 200 EMA' if in_possession else 'pinned back under the defensive 200 EMA line'}.
-                * **🛡️ Defensive Verdict:** Stop distance is **{stop_metric:.1f} {metric_label}** ({spread_risk}). Sizing strictly capped at **{sizing_label}**. Maintain adherence to the active directive box above.
+                * **🏟️ Liquidity & Velocity:** Session is **{session_name}**. ADX is **{latest['ADX']:.1f}** ({trend_state}).
+                * **⚽ Momentum & Value:** RSI is **{latest['RSI']:.1f}**. Price is {'controlling macro midfield above the 200 EMA' if in_possession else 'pinned back under the defensive 200 EMA line'}.
+                * **🛡️ Defensive Verdict:** Sizing strictly capped at **{sizing_label}**. Maintain discipline until ADX confirms momentum.
                 """,
                 "timestamp": now_est.strftime("%H:%M:%S EST"),
                 "is_llm": False
@@ -537,13 +547,17 @@ fig.add_trace(go.Scatter(
 ), row=1, col=1)
 
 fig.add_trace(go.Scatter(
+    x=df.index, y=df['ADX'], 
+    line=dict(color='#38bdf8', width=1.5), 
+    name="ADX Velocity"
+), row=2, col=1)
+fig.add_trace(go.Scatter(
     x=df.index, y=df['RSI'], 
-    line=dict(color='#c084fc', width=1.5), 
+    line=dict(color='#c084fc', width=1.2, dash='dot'), 
     name="RSI Stamina"
 ), row=2, col=1)
 
-fig.add_hline(y=70, line_dash="dash", line_color="#ef4444", row=2, col=1)
-fig.add_hline(y=30, line_dash="dash", line_color="#22c55e", row=2, col=1)
+fig.add_hline(y=adx_min, line_dash="dash", line_color="#38bdf8", row=2, col=1)
 
 fig.update_layout(
     template="plotly_dark",
@@ -573,7 +587,7 @@ if not is_crypto:
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
 
 # =========================================================
-# 12. 📊 QUANTITATIVE BACKTEST (ADAPTIVE R:R & CAPITAL PROTECTION)
+# 12. 📊 QUANTITATIVE BACKTEST (ADX GATED + 1D UNLOCKED)
 # =========================================================
 st.write("---")
 st.subheader(f"Tactical Match Performance & Win Rate: {selected_label} [{timeframe}]")
@@ -588,7 +602,7 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_tar
     for i in range(50, len(df)):
         row = df.iloc[i]
 
-        # 1. Manage Active Position with +1.2 R Breakeven Protection
+        # 1. Manage Active Position
         if in_trade:
             if active_trade['type'] == 'BUY':
                 if not active_trade['be_triggered'] and row['High'] >= active_trade['be_threshold']:
@@ -655,8 +669,8 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_tar
                     in_trade = False
             continue
 
-        # 2. Check for Qualified Entry During Active Session
-        session_valid, _ = evaluate_session_timing(ticker_label, row.name)
+        # 2. Check for Qualified Entry
+        session_valid, _ = evaluate_session_timing(ticker_label, row.name, timeframe)
         if not session_valid:
             continue
 
@@ -711,7 +725,6 @@ if not perf_df.empty:
     scratches = len(completed[completed['Result'] == 'SCRATCH'])
     losses = len(completed[completed['Result'] == 'LOSS'])
     
-    # Direct outcome rate (Wins vs true Losses)
     decided_trades = wins + losses
     win_rate = (wins / decided_trades * 100) if decided_trades > 0 else 0.0
     net_r = (wins * target_rr) - (losses * 1.0)
@@ -725,4 +738,4 @@ if not perf_df.empty:
     with st.expander(f"Detailed Match Call Log ({len(perf_df)} Total Plays)", expanded=False):
         st.dataframe(perf_df.iloc[::-1], use_container_width=True, hide_index=True)
 else:
-    st.info("No tactical setups triggered during active liquidity windows under trend slope filter.")
+    st.info(f"No tactical setups triggered during active liquidity windows with ADX $\ge$ {adx_min}.")
