@@ -141,16 +141,13 @@ def evaluate_session_timing(ticker_label, dt):
         
     hour_est = dt_est.hour + (dt_est.minute / 60.0)
 
-    # European pairs -> London Core (03:00 - 12:00 EST)
     if any(k in ticker_label for k in ["EUR", "GBP", "CHF"]) and "USD" not in ticker_label and "JPY" not in ticker_label:
         return (3.0 <= hour_est <= 12.0), "London Core (03:00 - 12:00 EST)"
     
-    # USD / CAD / Gold -> NY Core & London Overlap (08:00 - 16:30 EST or 03:00 - 11:30 EST)
     if any(k in ticker_label for k in ["USD", "CAD", "GC=F"]):
         active = (8.0 <= hour_est <= 16.3) or (3.0 <= hour_est <= 11.5)
         return active, "NY / London Overlap (08:00 - 16:30 EST)"
     
-    # Asian pairs -> Tokyo Active (19:00 - 04:00 EST or 03:00 - 11:30 EST)
     if any(k in ticker_label for k in ["JPY", "AUD", "NZD"]):
         active = (hour_est >= 19.0 or hour_est <= 4.0) or (3.0 <= hour_est <= 11.5)
         return active, "Tokyo / Asian Active"
@@ -160,16 +157,20 @@ def evaluate_session_timing(ticker_label, dt):
 def is_session_active(ticker_label):
     return evaluate_session_timing(ticker_label, now_est)
 
-# 6. Data Ingestion & Technical Calculations
+# 6. Data Ingestion & Technical Calculations (With Slope & EMA Stacking)
 period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
 fetch_period = period_map.get(timeframe, "10d")
 
 def process_indicators(df):
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 55:
         return None
     df = df.copy()
     df['Midfield_200EMA'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['Tempo_20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
+
+    # Slope check: 200 EMA direction over preceding 5 candles
+    df['EMA200_Slope_Bull'] = df['Midfield_200EMA'] > df['Midfield_200EMA'].shift(5)
+    df['EMA200_Slope_Bear'] = df['Midfield_200EMA'] < df['Midfield_200EMA'].shift(5)
 
     hl = df['High'] - df['Low']
     hc = (df['High'] - df['Close'].shift()).abs()
@@ -183,15 +184,15 @@ def process_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # Signal definitions with candlestick confirmation
-    in_possession_bull = df['Close'] > df['Midfield_200EMA']
-    pullback_to_box = (df['Low'] <= df['Tempo_20EMA']) & (df['Close'] >= df['Tempo_20EMA'] * 0.998)
+    # UPGRADED RULES: Stacking (Price > 20 EMA > 200 EMA) + Sloping 200 EMA + Confirmation Candle
+    in_possession_bull = (df['Close'] > df['Tempo_20EMA']) & (df['Tempo_20EMA'] > df['Midfield_200EMA']) & df['EMA200_Slope_Bull']
+    pullback_to_box = (df['Low'] <= df['Tempo_20EMA'] * 1.001) & (df['Close'] >= df['Tempo_20EMA'] * 0.998)
     striker_primed_bull = (df['RSI'] >= 40) & (df['RSI'] <= 55)
     bull_candle_confirm = df['Close'] > df['Open']
     df['Striker_Buy'] = in_possession_bull & pullback_to_box & striker_primed_bull & bull_candle_confirm
 
-    in_possession_bear = df['Close'] < df['Midfield_200EMA']
-    rally_to_box = (df['High'] >= df['Tempo_20EMA']) & (df['Close'] <= df['Tempo_20EMA'] * 1.002)
+    in_possession_bear = (df['Close'] < df['Tempo_20EMA']) & (df['Tempo_20EMA'] < df['Midfield_200EMA']) & df['EMA200_Slope_Bear']
+    rally_to_box = (df['High'] >= df['Tempo_20EMA'] * 0.999) & (df['Close'] <= df['Tempo_20EMA'] * 1.002)
     striker_primed_bear = (df['RSI'] >= 45) & (df['RSI'] <= 60)
     bear_candle_confirm = df['Close'] < df['Open']
     df['Striker_Sell'] = in_possession_bear & rally_to_box & striker_primed_bear & bear_candle_confirm
@@ -275,7 +276,7 @@ if active_buys or active_sells:
         alert_msg.append(f"🔴 **LIVE SELL:** {', '.join(active_sells)}")
     st.success(" | ".join(alert_msg))
 else:
-    st.info("🟡 **Radar Clean:** No setups currently in strike zone during active market hours.")
+    st.info("🟡 **Radar Clean:** No instruments in strike zone during active market sessions.")
 
 with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
     radar_df = pd.DataFrame(radar_records)
@@ -372,10 +373,11 @@ if active_buy_signal and session_ok:
     ### 🟢 ACTIVE DIRECTIVE: BUY / LONG SIGNAL
     * **Order Type:** Market Buy
     * **Entry Price:** `{latest['Close']:.{p_dec}f}`
-    * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_metric:.1f} {metric_label})
+    * **Initial Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (+{stop_metric * 2:.1f} {metric_label} | 1:2 R:R)
+    * **Defensive Rule:** Move SL to Breakeven `{latest['Close']:.{p_dec}f}` once price tags +{stop_metric:.1f} {metric_label} (+1.0 R).
     * **Suggested Sizing:** `{sizing_label}`
-    * **Tactical Confirmation:** Above 200 EMA + Bullish bounce off 20 EMA + RSI primed ({latest['RSI']:.1f})
+    * **Tactical Confirmation:** Price > 20 EMA > 200 EMA + Upward Slope + Bullish Confirmation Candle.
     """)
 elif active_sell_signal and session_ok:
     sl_price = latest['Close'] + stop_distance_price
@@ -384,23 +386,24 @@ elif active_sell_signal and session_ok:
     ### 🔴 ACTIVE DIRECTIVE: SELL / SHORT SIGNAL
     * **Order Type:** Market Sell
     * **Entry Price:** `{latest['Close']:.{p_dec}f}`
-    * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_metric:.1f} {metric_label})
+    * **Initial Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (-{stop_metric * 2:.1f} {metric_label} | 1:2 R:R)
+    * **Defensive Rule:** Move SL to Breakeven `{latest['Close']:.{p_dec}f}` once price tags -{stop_metric:.1f} {metric_label} (+1.0 R).
     * **Suggested Sizing:** `{sizing_label}`
-    * **Tactical Confirmation:** Below 200 EMA + Bearish rejection off 20 EMA + RSI primed ({latest['RSI']:.1f})
+    * **Tactical Confirmation:** Price < 20 EMA < 200 EMA + Downward Slope + Bearish Confirmation Candle.
     """)
 elif (active_buy_signal or active_sell_signal) and not session_ok:
     st.warning(f"""
     ### ⏸️ DIRECTIVE PAUSED: OFF-HOURS / LOW LIQUIDITY
-    * **Technical Setup Met:** Technical entry conditions confirmed on chart.
+    * **Technical Setup Met:** Directional pullback confirmed on chart.
     * **Session Guard:** Blocked because **{selected_label}** trades during **{session_name}**.
-    * **Reason:** Current time ({now_est.strftime('%H:%M EST')}) lacks institutional liquidity. Spreads can widen and price will stall. Wait for active session open.
+    * **Reason:** Current time ({now_est.strftime('%H:%M EST')}) lacks institutional liquidity. Wait for session open.
     """)
 else:
     dist_to_ema20 = abs(latest['Close'] - latest['Tempo_20EMA']) / pip_scale
     st.info(f"""
     ### 🟡 TACTICAL DIRECTIVE: STAND BY (PATIENT POSSESSION)
-    * **Status:** No trigger on active candle. Maintain position discipline.
+    * **Status:** No qualified trend pullback. Maintain position discipline.
     * **Tactical Read:** Retest at 20 EMA is {dist_to_ema20:.1f} {metric_label} away at `{latest['Tempo_20EMA']:.{p_dec}f}`. Current RSI: `{latest['RSI']:.1f}`.
     * **Session Status:** {session_name} ({'Active' if session_ok else 'Closed / Low Volume'}).
     """)
@@ -562,7 +565,7 @@ if not is_crypto:
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
 
 # =========================================================
-# 12. 📊 QUANTITATIVE BACKTEST ENGINE (DISCIPLINED)
+# 12. 📊 QUANTITATIVE BACKTEST (WITH +1.0 R BREAK-EVEN RATCHET)
 # =========================================================
 st.write("---")
 st.subheader(f"Tactical Match Performance & Win Rate: {selected_label} [{timeframe}]")
@@ -577,10 +580,17 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy):
     for i in range(50, len(df)):
         row = df.iloc[i]
 
-        # 1. Manage Active Position (Single Active Position Rule)
+        # 1. Manage Active Position with Break-Even Ratchet (+1.0 R)
         if in_trade:
+            # Check if trade reached +1.0 R to move SL to Entry (Breakeven)
             if active_trade['type'] == 'BUY':
+                if not active_trade['be_triggered'] and row['High'] >= active_trade['be_threshold']:
+                    active_trade['sl'] = active_trade['entry']
+                    active_trade['be_triggered'] = True
+
                 if row['Low'] <= active_trade['sl']:
+                    res = "SCRATCH" if active_trade['be_triggered'] else "LOSS"
+                    r_val = 0.0 if active_trade['be_triggered'] else -1.0
                     trades.append({
                         "Match Time": active_trade['time'],
                         "Tactic": "BUY",
@@ -588,8 +598,8 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy):
                         "Stop Loss": active_trade['sl'],
                         "Target (1:2)": active_trade['tp'],
                         f"Risk ({metric_label})": active_trade['risk'],
-                        "Result": "LOSS",
-                        "R-Return": "-1.0 R"
+                        "Result": res,
+                        "R-Return": f"{r_val:+.1f} R"
                     })
                     in_trade = False
                 elif row['High'] >= active_trade['tp']:
@@ -604,8 +614,15 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy):
                         "R-Return": "+2.0 R"
                     })
                     in_trade = False
+
             elif active_trade['type'] == 'SELL':
+                if not active_trade['be_triggered'] and row['Low'] <= active_trade['be_threshold']:
+                    active_trade['sl'] = active_trade['entry']
+                    active_trade['be_triggered'] = True
+
                 if row['High'] >= active_trade['sl']:
+                    res = "SCRATCH" if active_trade['be_triggered'] else "LOSS"
+                    r_val = 0.0 if active_trade['be_triggered'] else -1.0
                     trades.append({
                         "Match Time": active_trade['time'],
                         "Tactic": "SELL",
@@ -613,8 +630,8 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy):
                         "Stop Loss": active_trade['sl'],
                         "Target (1:2)": active_trade['tp'],
                         f"Risk ({metric_label})": active_trade['risk'],
-                        "Result": "LOSS",
-                        "R-Return": "-1.0 R"
+                        "Result": res,
+                        "R-Return": f"{r_val:+.1f} R"
                     })
                     in_trade = False
                 elif row['Low'] <= active_trade['tp']:
@@ -650,6 +667,7 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy):
 
         sl_price = (entry_price - stop_dist) if is_buy else (entry_price + stop_dist)
         tp_price = (entry_price + tp_dist) if is_buy else (entry_price - tp_dist)
+        be_trigger_price = (entry_price + stop_dist) if is_buy else (entry_price - stop_dist)
 
         in_trade = True
         active_trade = {
@@ -658,10 +676,12 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy):
             "entry": round(entry_price, p_dec),
             "sl": round(sl_price, p_dec),
             "tp": round(tp_price, p_dec),
+            "be_threshold": round(be_trigger_price, p_dec),
+            "be_triggered": False,
             "risk": round(stop_units, 1)
         }
 
-    # If trade is still running on the latest candle
+    # Unclosed trade on the live candle
     if in_trade:
         trades.append({
             "Match Time": active_trade['time'],
@@ -679,20 +699,21 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy):
 perf_df = calculate_historical_performance(df, selected_label, is_crypto, is_jpy)
 
 if not perf_df.empty:
-    completed = perf_df[perf_df['Result'].isin(['WIN', 'LOSS'])]
+    completed = perf_df[perf_df['Result'].isin(['WIN', 'LOSS', 'SCRATCH'])]
     total_completed = len(completed)
     wins = len(completed[completed['Result'] == 'WIN'])
+    scratches = len(completed[completed['Result'] == 'SCRATCH'])
     losses = len(completed[completed['Result'] == 'LOSS'])
     win_rate = (wins / total_completed * 100) if total_completed > 0 else 0.0
-    net_r = (wins * 2.0) - (losses * 1.0)
+    net_r = (wins * 2.0) - (losses * 1.0)  # Scratches contribute 0.0 R
 
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Disciplined Calls", f"{len(perf_df)} Plays", f"{total_completed} Completed")
-    b2.metric("Tactical Win Rate", f"{win_rate:.1f}%", f"{wins}W - {losses}L")
+    b2.metric("Tactical Win Rate", f"{win_rate:.1f}%", f"{wins}W - {scratches}BE - {losses}L")
     b3.metric("Net Expectancy", f"{net_r:+.1f} R", delta="Net Positive" if net_r > 0 else "-Drawdown")
-    b4.metric("Risk-to-Reward Profile", "1 : 2.0", "Asymmetric Target")
+    b4.metric("Risk-to-Reward Profile", "1 : 2.0", "Break-Even Protected")
 
     with st.expander(f"Detailed Match Call Log ({len(perf_df)} Total Plays)", expanded=False):
         st.dataframe(perf_df.iloc[::-1], use_container_width=True, hide_index=True)
 else:
-    st.info("No tactical setups triggered during active liquidity windows in this historical sample.")
+    st.info("No tactical setups triggered during active liquidity windows under trend slope filter.")
