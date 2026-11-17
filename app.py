@@ -10,9 +10,9 @@ import pytz
 import os
 
 # =========================================================
-# 1. Page Configuration & Custom Tactical Theme
+# 1. Page Configuration & Tactical War Room CSS
 # =========================================================
-st.set_page_config(page_title="Tactical War Room | FX Terminal", layout="wide")
+st.set_page_config(page_title="Tactical War Room | FX MTF Terminal", layout="wide")
 
 refresh_cycle = st_autorefresh(interval=20000, limit=2000, key="fx_stream_sync")
 
@@ -83,7 +83,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================================================
-# 2. Watchlist Roster & Session Rules
+# 2. Watchlist Roster & MTF Mapping
 # =========================================================
 FOREX_ROSTER = {
     "USD/JPY": "USDJPY=X",
@@ -100,16 +100,29 @@ FOREX_ROSTER = {
     "EUR/GBP": "EURGBP=X"
 }
 
+# Execution Timeframe -> (Higher Timeframe, Fetch Period LTF, Fetch Period HTF)
+MTF_CONFIG = {
+    "1m":  {"htf": "5m",  "ltf_period": "2d",  "htf_period": "5d"},
+    "5m":  {"htf": "15m", "ltf_period": "5d",  "htf_period": "10d"},
+    "15m": {"htf": "1h",  "ltf_period": "10d", "htf_period": "30d"},
+    "30m": {"htf": "4h",  "ltf_period": "20d", "htf_period": "60d"},
+    "1h":  {"htf": "1d",  "ltf_period": "30d", "htf_period": "1y"},
+    "4h":  {"htf": "1d",  "ltf_period": "60d", "htf_period": "1y"},
+    "1d":  {"htf": "1wk", "ltf_period": "1y",  "htf_period": "3y"}
+}
+
 st.sidebar.title("Tactical Room")
-timeframe = st.sidebar.selectbox("Match Timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], index=2)
+timeframe = st.sidebar.selectbox("Match Timeframe (LTF)", list(MTF_CONFIG.keys()), index=2)
+htf_tf = MTF_CONFIG[timeframe]["htf"]
+
+st.sidebar.markdown(f"**Macro Filter:** `{htf_tf.upper()}` (Higher Pitch Alignment)")
+use_htf = st.sidebar.checkbox(f"Enforce {htf_tf.upper()} Macro Alignment", value=True,
+                              help="Only takes Longs if HTF is above its 50 EMA; Shorts if below its 50 EMA.")
+
 target_rr = st.sidebar.selectbox("Tactical Risk:Reward Profile", [1.5, 2.0, 2.5], index=1)
 adx_min = st.sidebar.slider("Chop Filter: Min ADX Velocity", min_value=15, max_value=32, value=22, step=1)
-
-st.sidebar.subheader("Execution Quality Gates")
-require_rejection_wick = st.sidebar.checkbox("Require Rejection Wick Confirmation", value=True,
-                                             help="Only strike if candle shows rejection wick at the 20 EMA and closes in trend direction.")
-pullback_atr_depth = st.sidebar.slider("Pullback Tolerance (x ATR)", 0.2, 0.8, 0.45, 0.05,
-                                       help="How close price must touch the 20 EMA relative to volatility.")
+require_rejection_wick = st.sidebar.checkbox("Require Rejection Wick Confirmation", value=True)
+pullback_atr_depth = st.sidebar.slider("Pullback Tolerance (x ATR)", 0.2, 0.8, 0.45, 0.05)
 
 st.sidebar.write("---")
 st.sidebar.subheader("Account & Risk Management")
@@ -132,7 +145,6 @@ def evaluate_session_timing(ticker_label, dt, tf_label):
         return True, "Macro Session"
     if "BTC" in ticker_label:
         return True, "Crypto 24/7"
-    
     try:
         if dt.tzinfo is None:
             dt_est = pytz.timezone("UTC").localize(dt).astimezone(est_tz)
@@ -143,9 +155,6 @@ def evaluate_session_timing(ticker_label, dt, tf_label):
         
     hour_est = dt_est.hour + (dt_est.minute / 60.0)
 
-    # London Core: 03:00 - 11:30 EST
-    # NY Overlap: 08:00 - 16:30 EST
-    # Asian Session (JPY/AUD/NZD): 19:00 - 04:00 EST
     if any(k in ticker_label for k in ["JPY", "AUD", "NZD"]):
         active = (hour_est >= 19.0 or hour_est <= 4.5) or (3.0 <= hour_est <= 11.5) or (8.0 <= hour_est <= 16.3)
         return active, "Tokyo / Core Active"
@@ -161,17 +170,44 @@ def is_session_active(ticker_label):
     return evaluate_session_timing(ticker_label, now_est, timeframe)
 
 # =========================================================
-# 4. Quantitative Indicators & Strike Engine
+# 4. Multi-Timeframe Data Engine & Quantitative Indicators
 # =========================================================
-period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
-fetch_period = period_map.get(timeframe, "10d")
+@st.cache_data(ttl=20)
+def fetch_raw_data(symbols, interval, period):
+    return yf.download(symbols, period=period, interval=interval, group_by='ticker', progress=False)
 
-def process_indicators(df):
-    if df is None or len(df) < 55:
+def process_mtf_indicators(df_ltf, df_htf, enforce_htf):
+    if df_ltf is None or len(df_ltf) < 55 or df_htf is None or len(df_htf) < 50:
         return None
-    df = df.copy()
 
-    # Dynamic EMAs
+    # 1. Normalize timezones to UTC for seamless merging
+    df_ltf = df_ltf.copy()
+    df_htf = df_htf.copy()
+
+    df_ltf.index = pd.to_datetime(df_ltf.index).tz_convert('UTC') if df_ltf.index.tz is not None else pd.to_datetime(df_ltf.index).tz_localize('UTC')
+    df_htf.index = pd.to_datetime(df_htf.index).tz_convert('UTC') if df_htf.index.tz is not None else pd.to_datetime(df_htf.index).tz_localize('UTC')
+
+    df_ltf = df_ltf.sort_index()
+    df_htf = df_htf.sort_index()
+
+    # 2. HTF Trend Indicators (50 EMA)
+    df_htf['HTF_50EMA'] = df_htf['Close'].ewm(span=50, adjust=False).mean()
+    df_htf['HTF_Bull'] = df_htf['Close'] > df_htf['HTF_50EMA']
+    df_htf['HTF_Bear'] = df_htf['Close'] < df_htf['HTF_50EMA']
+
+    # CRITICAL: Shift HTF indicators by 1 bar to prevent forward-looking bias
+    htf_signal_stream = df_htf[['HTF_50EMA', 'HTF_Bull', 'HTF_Bear']].shift(1)
+
+    # 3. Merge HTF onto LTF with backward fill
+    df = pd.merge_asof(
+        df_ltf,
+        htf_signal_stream,
+        left_index=True,
+        right_index=True,
+        direction='backward'
+    )
+
+    # 4. LTF EMAs
     df['Midfield_200EMA'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['Tempo_20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
 
@@ -182,7 +218,7 @@ def process_indicators(df):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df['ATR_14'] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # Wilder's Directional Movement & Smoothed ADX(14)
+    # Wilder's Directional Movement & ADX(14)
     up_move = df['High'] - df['High'].shift(1)
     down_move = df['Low'].shift(1) - df['Low']
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
@@ -194,25 +230,24 @@ def process_indicators(df):
     dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0)
     df['ADX'] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(0)
 
-    # RSI (14) with exponential smoothing
+    # Exponential RSI(14)
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
-    df['RSI'] = 100 - (100 / (1 + rs))
-    df['RSI'] = df['RSI'].fillna(50)
+    df['RSI'] = (100 - (100 / (1 + rs))).fillna(50)
 
-    # 200 EMA Slope Direction
+    # 200 EMA Angle Slope
     slope_diff = df['Midfield_200EMA'] - df['Midfield_200EMA'].shift(5)
     df['EMA200_Slope_Bull'] = slope_diff > (df['ATR_14'] * 0.04)
     df['EMA200_Slope_Bear'] = slope_diff < -(df['ATR_14'] * 0.04)
 
-    # ATR-Normalized Pullback Zone
+    # ATR Pullback Zone
     box_buffer = df['ATR_14'] * pullback_atr_depth
     bull_pullback = (df['Low'] <= df['Tempo_20EMA'] + box_buffer) & (df['Close'] >= df['Tempo_20EMA'] - box_buffer)
     bear_rally = (df['High'] >= df['Tempo_20EMA'] - box_buffer) & (df['Close'] <= df['Tempo_20EMA'] + box_buffer)
 
-    # Candlestick Anatomy & Rejection Wicks
+    # Rejection Wick
     body_size = (df['Close'] - df['Open']).abs()
     lower_wick = df[['Open', 'Close']].min(axis=1) - df['Low']
     upper_wick = df['High'] - df[['Open', 'Close']].max(axis=1)
@@ -220,46 +255,57 @@ def process_indicators(df):
     bull_rejection = (lower_wick >= body_size * 0.6) | (df['Close'] > df['Open']) if require_rejection_wick else True
     bear_rejection = (upper_wick >= body_size * 0.6) | (df['Close'] < df['Open']) if require_rejection_wick else True
 
-    # Signal Rules
+    # Master Signal Logic
     has_velocity = df['ADX'] >= adx_min
     bull_structure = (df['Close'] > df['Midfield_200EMA']) & df['EMA200_Slope_Bull'] & has_velocity
     bear_structure = (df['Close'] < df['Midfield_200EMA']) & df['EMA200_Slope_Bear'] & has_velocity
 
-    df['Striker_Buy'] = bull_structure & bull_pullback & bull_rejection & (df['RSI'] >= 40) & (df['RSI'] <= 60)
-    df['Striker_Sell'] = bear_structure & bear_rally & bear_rejection & (df['RSI'] >= 40) & (df['RSI'] <= 60)
+    htf_long_ok = df['HTF_Bull'] if enforce_htf else True
+    htf_short_ok = df['HTF_Bear'] if enforce_htf else True
+
+    df['Striker_Buy'] = bull_structure & bull_pullback & bull_rejection & (df['RSI'] >= 40) & (df['RSI'] <= 60) & htf_long_ok
+    df['Striker_Sell'] = bear_structure & bear_rally & bear_rejection & (df['RSI'] >= 40) & (df['RSI'] <= 60) & htf_short_ok
 
     return df
 
-@st.cache_data(ttl=20)
-def scan_all_markets(roster, interval, period):
+def scan_all_mtf(roster, ltf_tf, cfg, enforce_htf):
     ticker_symbols = list(roster.values())
-    raw_data = yf.download(ticker_symbols, period=period, interval=interval, group_by='ticker', progress=False)
+    raw_ltf = fetch_raw_data(ticker_symbols, interval=ltf_tf, period=cfg["ltf_period"])
+    raw_htf = fetch_raw_data(ticker_symbols, interval=cfg["htf"], period=cfg["htf_period"])
 
     results = {}
     for label, sym in roster.items():
         try:
-            if isinstance(raw_data.columns, pd.MultiIndex):
-                if sym in raw_data.columns.levels[0]:
-                    df_pair = raw_data[sym].dropna(subset=['Close'])
-                else:
-                    continue
+            # Extract LTF
+            if isinstance(raw_ltf.columns, pd.MultiIndex):
+                if sym in raw_ltf.columns.levels[0]:
+                    df_p_ltf = raw_ltf[sym].dropna(subset=['Close'])
+                else: continue
             else:
-                df_pair = raw_data.dropna(subset=['Close'])
+                df_p_ltf = raw_ltf.dropna(subset=['Close'])
 
-            df_processed = process_indicators(df_pair)
-            if df_processed is not None and not df_processed.empty:
-                results[label] = df_processed
+            # Extract HTF
+            if isinstance(raw_htf.columns, pd.MultiIndex):
+                if sym in raw_htf.columns.levels[0]:
+                    df_p_htf = raw_htf[sym].dropna(subset=['Close'])
+                else: continue
+            else:
+                df_p_htf = raw_htf.dropna(subset=['Close'])
+
+            processed = process_mtf_indicators(df_p_ltf, df_p_htf, enforce_htf)
+            if processed is not None and not processed.empty:
+                results[label] = processed
         except Exception:
             continue
     return results
 
-market_data = scan_all_markets(FOREX_ROSTER, timeframe, fetch_period)
+market_data = scan_all_mtf(FOREX_ROSTER, timeframe, MTF_CONFIG[timeframe], use_htf)
 
 # =========================================================
-# 5. Tactical Radar Scanner
+# 5. Tactical Radar Scanner (With MTF Alignment Display)
 # =========================================================
 st.title("Tactical Radar: All-Pitch Scanner")
-st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} (NY Time) | Velocity Gate: ADX $\ge$ {adx_min}")
+st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} | Primary: `{timeframe}` | Macro Anchor: `{htf_tf.upper()}` 50 EMA")
 
 radar_records = []
 active_buys, active_sells = [], []
@@ -283,10 +329,13 @@ for label, df_item in market_data.items():
         status = "🔴 SELL" if session_ok else "⏸️ SELL (Off-Hours)"
         if session_ok: active_sells.append(label)
 
+    htf_state = "🟢 Bullish" if bool(latest.get('HTF_Bull', False)) else "🔴 Bearish"
+
     p_dec = 1 if is_crypto else (3 if is_jpy else 5)
     radar_records.append({
         "Instrument": label,
         "Signal": status,
+        f"{htf_tf.upper()} Trend": htf_state,
         "Session": "Active" if session_ok else "Low Volume",
         "Price": f"{latest['Close']:.{p_dec}f}",
         "ADX Velocity": f"{latest['ADX']:.1f}",
@@ -296,11 +345,11 @@ for label, df_item in market_data.items():
 
 if active_buys or active_sells:
     alerts = []
-    if active_buys: alerts.append(f"🟢 **LIVE STRIKE BUY:** {', '.join(active_buys)}")
-    if active_sells: alerts.append(f"🔴 **LIVE STRIKE SELL:** {', '.join(active_sells)}")
+    if active_buys: alerts.append(f"🟢 **LIVE MTF BUY:** {', '.join(active_buys)}")
+    if active_sells: alerts.append(f"🔴 **LIVE MTF SELL:** {', '.join(active_sells)}")
     st.success(" | ".join(alerts))
 else:
-    st.info(f"🟡 **Pitch Clean:** No setups currently meeting the ADX $\ge$ {adx_min} velocity and rejection threshold.")
+    st.info(f"🟡 **Pitch Clean:** No setups currently aligning with `{timeframe}` momentum + `{htf_tf.upper()}` macro direction.")
 
 with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
     radar_df = pd.DataFrame(radar_records)
@@ -312,7 +361,7 @@ with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
 st.write("---")
 
 # =========================================================
-# 6. Detailed Pitch Inspector & Precise Position Sizing
+# 6. Detailed Pitch Inspector
 # =========================================================
 pitch_options = list(market_data.keys())
 if "selected_pitch_key" not in st.session_state or st.session_state.selected_pitch_key not in pitch_options:
@@ -348,7 +397,6 @@ else:
     stop_metric = max(raw_pips, 8.0)
     stop_distance_price = stop_metric * pip_scale
 
-    # OANDA Pip Value Formula
     pip_value_std_lot = (pip_scale / latest['Close']) * 100_000 if is_jpy else 10.0
     risk_dollars = account_nav * risk_pct
     lots_by_risk = risk_dollars / (stop_metric * pip_value_std_lot)
@@ -359,100 +407,113 @@ else:
 
     allowed_standard_lots = min(lots_by_risk, lots_by_margin)
     required_margin = allowed_standard_lots * margin_per_lot
-    
-    # Render units or micro-lots cleanly for smaller accounts
+
     units_count = allowed_standard_lots * 100_000
-    if allowed_standard_lots < 0.1:
-        sizing_label = f"{units_count:,.0f} Units ({allowed_standard_lots:.3f} Lots)"
-    else:
-        sizing_label = f"{allowed_standard_lots:.2f} Std Lots"
+    sizing_label = f"{units_count:,.0f} Units ({allowed_standard_lots:.3f} Lots)" if allowed_standard_lots < 0.1 else f"{allowed_standard_lots:.2f} Std Lots"
 
 p_dec = 1 if is_crypto else (3 if is_jpy else 5)
 price_fmt = f"{latest['Close']:.{p_dec}f}"
 in_possession = bool(latest['Close'] > latest['Midfield_200EMA'])
-active_buy = bool(latest['Striker_Buy'])
-active_sell = bool(latest['Striker_Sell'])
+htf_is_bull = bool(latest.get('HTF_Bull', False))
 
 status_color = "#10b981" if in_possession else "#ef4444"
 status_text = "POSSESSION (ATTACKING)" if in_possession else "DEFENDING (COUNTER-ATTACK)"
+htf_badge_color = "#10b981" if htf_is_bull else "#ef4444"
+htf_text = f"MACRO [{htf_tf.upper()}]: {'BULLISH' if htf_is_bull else 'BEARISH'}"
 
 st.markdown(f"""
 <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.2rem;">
     <h2 style="margin: 0; font-size: 1.5rem; font-weight: 700;">Pitch Focus: {selected_label} <span style="font-size: 0.95rem; color: #64748b; font-weight: 400;">[{timeframe}]</span></h2>
-    <span style="background: rgba({ '16, 185, 129' if in_possession else '239, 68, 68' }, 0.15); 
-                 color: {status_color}; border: 1px solid {status_color}; padding: 4px 12px; border-radius: 16px; font-size: 0.8rem; font-weight: 700;">
-        {status_text}
-    </span>
+    <div style="display: flex; gap: 8px;">
+        <span style="background: rgba({ '16, 185, 129' if htf_is_bull else '239, 68, 68' }, 0.15); 
+                     color: {htf_badge_color}; border: 1px solid {htf_badge_color}; padding: 4px 12px; border-radius: 16px; font-size: 0.8rem; font-weight: 700;">
+            {htf_text}
+        </span>
+        <span style="background: rgba({ '16, 185, 129' if in_possession else '239, 68, 68' }, 0.15); 
+                     color: {status_color}; border: 1px solid {status_color}; padding: 4px 12px; border-radius: 16px; font-size: 0.8rem; font-weight: 700;">
+            {status_text}
+        </span>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Live Market Price", price_fmt)
 c2.metric("ADX Momentum", f"{latest['ADX']:.1f}", delta="Trending" if latest['ADX'] >= adx_min else "-Chop Zone")
-c3.metric("Defensive Stop (1.5x ATR)", f"{stop_metric:.1f} {metric_label}", f"Target: +{stop_metric * target_rr:.1f} (1:{target_rr})")
+c3.metric(f"Defensive Stop", f"{stop_metric:.1f} {metric_label}", f"Target: +{stop_metric * target_rr:.1f} (1:{target_rr})")
 c4.metric(f"Strict Size ({risk_pct*100:.1f}% Risk)", sizing_label, f"Req Margin: ${required_margin:,.2f}")
 
 # =========================================================
 # 7. Active Directive Box
 # =========================================================
+active_buy = bool(latest['Striker_Buy'])
+active_sell = bool(latest['Striker_Sell'])
 tp_mult = float(target_rr)
+
 if active_buy and session_ok:
     sl_price = latest['Close'] - stop_distance_price
     tp_price = latest['Close'] + (stop_distance_price * tp_mult)
     st.success(f"""
-    ### 🟢 ACTIVE DIRECTIVE: BUY / LONG SIGNAL
+    ### 🟢 ACTIVE DIRECTIVE: BUY / LONG SIGNAL (MTF CONFIRMED)
     * **Order Type:** Market Buy
     * **Entry Price:** `{latest['Close']:.{p_dec}f}`
     * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (+{stop_metric * tp_mult:.1f} {metric_label} | 1:{tp_mult} R:R)
-    * **Defensive Rule:** Move SL to Breakeven after reaching +1.0R (`{latest['Close'] + stop_distance_price:.{p_dec}f}`).
+    * **Macro Confirmation:** Price is synchronized with {htf_tf.upper()} 50 EMA trend.
+    * **Defensive Rule:** Move SL to Breakeven at +1.0R (`{latest['Close'] + stop_distance_price:.{p_dec}f}`).
     """)
 elif active_sell and session_ok:
     sl_price = latest['Close'] + stop_distance_price
     tp_price = latest['Close'] - (stop_distance_price * tp_mult)
     st.error(f"""
-    ### 🔴 ACTIVE DIRECTIVE: SELL / SHORT SIGNAL
+    ### 🔴 ACTIVE DIRECTIVE: SELL / SHORT SIGNAL (MTF CONFIRMED)
     * **Order Type:** Market Sell
     * **Entry Price:** `{latest['Close']:.{p_dec}f}`
     * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (-{stop_metric * tp_mult:.1f} {metric_label} | 1:{tp_mult} R:R)
-    * **Defensive Rule:** Move SL to Breakeven after reaching +1.0R (`{latest['Close'] - stop_distance_price:.{p_dec}f}`).
+    * **Macro Confirmation:** Price is synchronized with {htf_tf.upper()} 50 EMA trend.
+    * **Defensive Rule:** Move SL to Breakeven at +1.0R (`{latest['Close'] - stop_distance_price:.{p_dec}f}`).
     """)
 else:
+    conflict_note = f"HTF is {htf_state}, blocking opposing LTF noise." if use_htf else "Scanning for structure touch."
     st.info(f"""
     ### 🟡 TACTICAL DIRECTIVE: STAND BY (PATIENT POSSESSION)
-    * **Status:** No qualified setup. Current ADX is `{latest['ADX']:.1f}` (Requires $\ge$ {adx_min} for trend velocity).
+    * **Status:** No qualified setup. ADX: `{latest['ADX']:.1f}` (Requires $\ge$ {adx_min}). {conflict_note}
     * **Session:** {session_name} ({'Active' if session_ok else 'Off-Hours'}).
     """)
 
 # =========================================================
-# 8. Interactive Pitch Chart
+# 8. Interactive Pitch Chart (With HTF Baseline)
 # =========================================================
 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.75, 0.25])
 
 fig.add_trace(go.Candlestick(
-    x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-    name="Price"
+    x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"
 ), row=1, col=1)
 
 fig.add_trace(go.Scatter(
-    x=df.index, y=df['Midfield_200EMA'], line=dict(color='#eab308', width=2), name="Midfield (200 EMA)"
+    x=df.index, y=df['Midfield_200EMA'], line=dict(color='#eab308', width=2), name="LTF 200 EMA"
 ), row=1, col=1)
 
 fig.add_trace(go.Scatter(
-    x=df.index, y=df['Tempo_20EMA'], line=dict(color='#38bdf8', width=1.5, dash='dot'), name="Tempo (20 EMA)"
+    x=df.index, y=df['Tempo_20EMA'], line=dict(color='#38bdf8', width=1.5, dash='dot'), name="LTF 20 EMA"
 ), row=1, col=1)
+
+if 'HTF_50EMA' in df.columns:
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['HTF_50EMA'], line=dict(color='#a855f7', width=2, dash='dash'), name=f"Macro {htf_tf.upper()} 50 EMA"
+    ), row=1, col=1)
 
 buy_plays = df[df['Striker_Buy']]
 fig.add_trace(go.Scatter(
     x=buy_plays.index, y=buy_plays['Low'] * (0.999 if is_jpy or is_crypto else 0.9998),
-    mode='markers', marker=dict(symbol='triangle-up', size=11, color='#22c55e'), name="Buy Entry"
+    mode='markers', marker=dict(symbol='triangle-up', size=11, color='#22c55e'), name="MTF Buy Entry"
 ), row=1, col=1)
 
 sell_plays = df[df['Striker_Sell']]
 fig.add_trace(go.Scatter(
     x=sell_plays.index, y=sell_plays['High'] * (1.001 if is_jpy or is_crypto else 1.0002),
-    mode='markers', marker=dict(symbol='triangle-down', size=11, color='#ef4444'), name="Sell Entry"
+    mode='markers', marker=dict(symbol='triangle-down', size=11, color='#ef4444'), name="MTF Sell Entry"
 ), row=1, col=1)
 
 fig.add_trace(go.Scatter(x=df.index, y=df['ADX'], line=dict(color='#38bdf8', width=1.5), name="ADX Velocity"), row=2, col=1)
@@ -475,10 +536,10 @@ if not is_crypto:
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
 
 # =========================================================
-# 9. Realistic Backtester Engine (No Same-Bar Lookahead)
+# 9. Realistic Backtester Engine (MTF Aligned)
 # =========================================================
 st.write("---")
-st.subheader(f"Tactical Match Performance & Win Rate: {selected_label} [{timeframe}]")
+st.subheader(f"Tactical Match Performance & Win Rate: {selected_label} [{timeframe} + {htf_tf.upper()}]")
 
 def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_target):
     trades = []
@@ -491,14 +552,11 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_tar
         row = df.iloc[i]
 
         if in_trade:
-            # BUY POSITION EVALUATION
             if active['type'] == 'BUY':
-                # Check Breakeven threshold reached
                 if not active['be_triggered'] and row['High'] >= active['be_threshold']:
                     active['sl'] = active['entry']
                     active['be_triggered'] = True
 
-                # Check Stop Loss hit
                 if row['Low'] <= active['sl']:
                     res = "SCRATCH" if active['be_triggered'] else "LOSS"
                     r_val = 0.0 if active['be_triggered'] else -1.0
@@ -513,7 +571,6 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_tar
                         "R-Return": f"{r_val:+.1f} R"
                     })
                     in_trade = False
-                # Check Take Profit hit
                 elif row['High'] >= active['tp']:
                     trades.append({
                         "Match Time": active['time'],
@@ -527,7 +584,6 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_tar
                     })
                     in_trade = False
 
-            # SELL POSITION EVALUATION
             elif active['type'] == 'SELL':
                 if not active['be_triggered'] and row['Low'] <= active['be_threshold']:
                     active['sl'] = active['entry']
@@ -561,7 +617,6 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_tar
                     in_trade = False
             continue
 
-        # Look for New Entries
         session_valid, _ = evaluate_session_timing(ticker_label, row.name, timeframe)
         if not session_valid:
             continue
@@ -616,4 +671,4 @@ if not perf_df.empty:
     with st.expander(f"Detailed Match Call Log ({len(perf_df)} Total Plays)", expanded=False):
         st.dataframe(perf_df.iloc[::-1], use_container_width=True, hide_index=True)
 else:
-    st.info(f"No tactical setups triggered during active liquidity windows with ADX $\ge$ {adx_min}.")
+    st.info(f"No setups triggered during active liquidity windows meeting LTF + {htf_tf.upper()} alignment.")
