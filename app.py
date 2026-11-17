@@ -296,15 +296,19 @@ else:
     """)
 
 # =========================================================
-# 9. 🤖 AI ASSISTANT MANAGER (TACTICAL DEBRIEF)
+# 9. 🤖 AI ASSISTANT MANAGER (TACTICAL DEBRIEF - PERSISTENT)
 # =========================================================
 st.write("---")
+
+if "ai_briefings" not in st.session_state:
+    st.session_state.ai_briefings = {}
+
 with st.expander("🤖 AI Assistant Manager (Tactical Debrief)", expanded=True):
-    col_ai_btn, col_ai_status = st.columns([1, 4])
+    col_ai_btn, col_ai_status = st.columns([1, 3])
     run_ai = col_ai_btn.button("Generate Tactical Briefing")
     
-    # Check for Gemini API Key in Secrets or Sidebar
     active_gemini_key = sidebar_gemini_key or st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+    briefing_key = f"{selected_label}_{timeframe}"
 
     if run_ai:
         if active_gemini_key:
@@ -312,7 +316,13 @@ with st.expander("🤖 AI Assistant Manager (Tactical Debrief)", expanded=True):
                 from google import genai
                 client = genai.Client(api_key=active_gemini_key)
                 
-                signal_label = "BUY" if (active_buy_signal and session_ok) else ("SELL" if (active_sell_signal and session_ok) else ("OFF_HOURS" if (active_buy_signal or active_sell_signal) else "STANDBY"))
+                signal_label = (
+                    "BUY" if (active_buy_signal and session_ok) else (
+                        "SELL" if (active_sell_signal and session_ok) else (
+                            "OFF_HOURS" if (active_buy_signal or active_sell_signal) else "STANDBY"
+                        )
+                    )
+                )
                 
                 prompt = f"""
                 You are an elite quantitative football-themed FX risk manager and tactical analyst.
@@ -334,26 +344,45 @@ with st.expander("🤖 AI Assistant Manager (Tactical Debrief)", expanded=True):
                 Keep it disciplined, direct, and under 150 words.
                 """
                 with st.spinner("AI analyzing tactical pitch and liquidity depth..."):
-                    res = client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=prompt
-                    )
-                    st.markdown(res.text)
+                    res = None
+                    candidate_models = ["gemini-3.0-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+                    for mod in candidate_models:
+                        try:
+                            res = client.models.generate_content(model=mod, contents=prompt)
+                            if res and res.text:
+                                break
+                        except Exception:
+                            continue
+
+                    if res and res.text:
+                        st.session_state.ai_briefings[briefing_key] = {
+                            "text": res.text,
+                            "timestamp": now_est.strftime("%H:%M:%S EST"),
+                            "is_llm": True
+                        }
+                    else:
+                        st.error("Could not reach active Gemini model endpoints. Check API project permissions.")
             except Exception as e:
                 st.error(f"AI connection error: {str(e)}")
         else:
-            # Algorithmic fallback if no API key is provided
-            st.info("💡 *No Gemini API Key detected. Using local algorithmic tactical debrief (add key in sidebar or Streamlit Secrets for full LLM analysis):*")
-            
-            # Rule-based algorithmic evaluation
             spread_risk = "High spread penalty risk" if stop_metric < 12.0 else "Healthy buffer over spread"
             momentum_state = "Overbought" if latest['RSI'] > 65 else ("Oversold" if latest['RSI'] < 35 else "Balanced momentum")
             
-            st.markdown(f"""
-            * **🏟️ Liquidity & Pitch Status:** Market session is **{session_name}** ({'Open with institutional backing' if session_ok else 'Illiquid off-hours; high risk of stalled price'}).
-            * **⚽ Momentum & Value:** RSI stands at **{latest['RSI']:.1f}** ({momentum_state}). Price is {'controlling macro midfield above the 200 EMA' if in_possession else 'pinned back under the defensive 200 EMA line'}.
-            * **🛡️ Defensive Verdict:** Stop distance is **{stop_metric:.1f} {metric_label}** ({spread_risk}). Sizing strictly capped at **{sizing_label}**. Maintain adherence to the active directive box above.
-            """)
+            st.session_state.ai_briefings[briefing_key] = {
+                "text": f"""
+                * **🏟️ Liquidity & Pitch Status:** Market session is **{session_name}** ({'Open with institutional backing' if session_ok else 'Illiquid off-hours; high risk of stalled price'}).
+                * **⚽ Momentum & Value:** RSI stands at **{latest['RSI']:.1f}** ({momentum_state}). Price is {'controlling macro midfield above the 200 EMA' if in_possession else 'pinned back under the defensive 200 EMA line'}.
+                * **🛡️ Defensive Verdict:** Stop distance is **{stop_metric:.1f} {metric_label}** ({spread_risk}). Sizing strictly capped at **{sizing_label}**. Maintain adherence to the active directive box above.
+                """,
+                "timestamp": now_est.strftime("%H:%M:%S EST"),
+                "is_llm": False
+            }
+
+    if briefing_key in st.session_state.ai_briefings:
+        briefing_data = st.session_state.ai_briefings[briefing_key]
+        badge = "✨ Live Gemini AI Briefing" if briefing_data["is_llm"] else "💡 Algorithmic Briefing"
+        st.caption(f"{badge} | Delivered at {briefing_data['timestamp']}")
+        st.markdown(briefing_data["text"])
 
 # 10. Interactive Chart
 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
@@ -396,3 +425,4 @@ if not is_crypto:
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
+
