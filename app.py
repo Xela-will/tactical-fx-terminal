@@ -10,12 +10,95 @@ import pytz
 import os
 
 # 1. Page Configuration
-st.set_page_config(page_title="Tactical FX Terminal", layout="wide")
+st.set_page_config(page_title="Tactical War Room | FX Terminal", layout="wide")
 
 # Polling engine: Auto-refreshes every 20 seconds
 refresh_cycle = st_autorefresh(interval=20000, limit=2000, key="fx_stream_sync")
 
-# 2. Watchlist Roster
+# 2. Tactical War Room CSS
+st.markdown("""
+<style>
+    /* Global Base */
+    .stApp {
+        background-color: #0b0f19;
+        color: #f3f4f6;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    /* Metric Cards - Tactical Stat Board */
+    div[data-testid="stMetric"] {
+        background: linear-gradient(135deg, rgba(17, 24, 39, 0.85) 0%, rgba(15, 23, 42, 0.65) 100%);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 16px 20px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+        backdrop-filter: blur(10px);
+        transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    div[data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        border-color: rgba(16, 185, 129, 0.4);
+    }
+    div[data-testid="stMetricLabel"] p {
+        font-size: 0.8rem !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #94a3b8 !important;
+    }
+    div[data-testid="stMetricValue"] div {
+        font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace !important;
+        font-weight: 700 !important;
+        color: #f8fafc !important;
+    }
+
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #080c14 !important;
+        border-right: 1px solid rgba(255, 255, 255, 0.06);
+    }
+    section[data-testid="stSidebar"] h1, 
+    section[data-testid="stSidebar"] h2, 
+    section[data-testid="stSidebar"] h3 {
+        color: #10b981 !important;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+    }
+
+    /* Expander Panels */
+    div[data-testid="stExpander"] {
+        background: rgba(15, 23, 42, 0.55) !important;
+        border: 1px solid rgba(255, 255, 255, 0.08) !important;
+        border-radius: 12px !important;
+        overflow: hidden;
+    }
+
+    /* Primary Action Buttons */
+    .stButton>button {
+        border-radius: 8px;
+        background: linear-gradient(135deg, #059669 0%, #10b981 100%);
+        color: #ffffff;
+        font-weight: 600;
+        border: none;
+        box-shadow: 0 2px 10px rgba(16, 185, 129, 0.3);
+        transition: all 0.2s ease;
+    }
+    .stButton>button:hover {
+        background: linear-gradient(135deg, #10b981 0%, #34d399 100%);
+        box-shadow: 0 4px 16px rgba(16, 185, 129, 0.5);
+        transform: translateY(-1px);
+    }
+
+    /* Dataframe Polish */
+    div[data-testid="stDataFrame"] {
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        overflow: hidden;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# 3. Watchlist Roster
 FOREX_ROSTER = {
     "USD/CAD": "USDCAD=X",
     "USD/JPY": "USDJPY=X",
@@ -31,7 +114,7 @@ FOREX_ROSTER = {
     "Bitcoin (BTC/USD)": "BTC-USD"
 }
 
-# 3. Sidebar Controls
+# 4. Sidebar Tactical Controls
 st.sidebar.title("Tactical Room")
 timeframe = st.sidebar.selectbox(
     "Match Timeframe", 
@@ -40,18 +123,18 @@ timeframe = st.sidebar.selectbox(
 )
 
 st.sidebar.write("---")
-st.sidebar.subheader("Account & Risk Settings")
+st.sidebar.subheader("Account & Risk Management")
 account_nav = st.sidebar.number_input("OANDA Balance / NAV ($)", value=798000.0, step=10000.0)
 risk_pct = st.sidebar.slider("Cash Risk per Trade (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1) / 100.0
 max_margin_pct = st.sidebar.slider("Max Collateral Allowed (%)", min_value=5, max_value=40, value=20, step=5) / 100.0
 
 st.sidebar.write("---")
 st.sidebar.subheader("AI Intelligence Layer")
-sidebar_gemini_key = st.sidebar.text_input("Gemini API Key (Optional)", type="password", help="Leave blank if set in Streamlit Secrets")
+sidebar_gemini_key = st.sidebar.text_input("Gemini API Key (Optional)", type="password", help="Leave blank if stored in Streamlit Secrets")
 
-st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Status: Connected")
+st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Feed: Active")
 
-# 4. Session Liquidity Filter (EST Timezone)
+# 5. Session Liquidity Filter (EST Timezone)
 est_tz = pytz.timezone("US/Eastern")
 now_est = datetime.now(est_tz)
 current_hour_est = now_est.hour + (now_est.minute / 60.0)
@@ -67,10 +150,10 @@ def is_session_active(ticker_label):
         return active, "NY / London Overlap (08:00 - 16:30 EST)"
     if any(k in ticker_label for k in ["JPY", "AUD", "NZD"]):
         active = (current_hour_est >= 19.0 or current_hour_est <= 4.0) or (3.0 <= current_hour_est <= 11.5)
-        return active, "Tokyo / London Active"
+        return active, "Tokyo / Asian Session"
     return True, "Open Liquidity"
 
-# 5. Data Fetching & Indicators
+# 6. Data Ingestion & Technical Processing
 period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
 fetch_period = period_map.get(timeframe, "10d")
 
@@ -93,6 +176,7 @@ def process_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
+    # Signal setups
     in_possession_bull = df['Close'] > df['Midfield_200EMA']
     pullback_to_box = (df['Low'] <= df['Tempo_20EMA']) & (df['Close'] >= df['Tempo_20EMA'] * 0.998)
     striker_primed_bull = (df['RSI'] >= 40) & (df['RSI'] <= 55)
@@ -130,7 +214,7 @@ def scan_all_markets(roster, interval, period):
 
 market_data = scan_all_markets(FOREX_ROSTER, timeframe, fetch_period)
 
-# 6. Tactical Radar Scanner
+# 7. Tactical Radar Scanner
 st.title("Tactical Radar: All-Pitch Scanner")
 st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} (New York Time)")
 
@@ -182,7 +266,7 @@ if active_buys or active_sells:
         alert_msg.append(f"🔴 **LIVE SELL:** {', '.join(active_sells)}")
     st.success(" | ".join(alert_msg))
 else:
-    st.info("🟡 **Radar Clean:** No instruments in strike zone during active market sessions.")
+    st.info("🟡 **Radar Clean:** No setups currently in strike zone during active market hours.")
 
 with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
     radar_df = pd.DataFrame(radar_records)
@@ -193,7 +277,7 @@ with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
 
 st.write("---")
 
-# 7. Detailed Pitch Inspector
+# 8. Detailed Pitch Inspector
 selected_label = st.selectbox(
     "Select Pitch to Inspect in Detail:",
     list(market_data.keys()),
@@ -247,14 +331,34 @@ in_possession = bool(latest['Close'] > latest['Midfield_200EMA'])
 active_buy_signal = bool(latest['Striker_Buy'])
 active_sell_signal = bool(latest['Striker_Sell'])
 
-st.subheader(f"Tactical Pitch: {selected_label} [{timeframe}]")
+# Styled Header Badge
+status_color = "#10b981" if in_possession else "#ef4444"
+status_text = "POSSESSION (ATTACKING)" if in_possession else "DEFENDING (COUNTER-ATTACK)"
+
+st.markdown(f"""
+<div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.2rem;">
+    <h2 style="margin: 0; font-size: 1.6rem; font-weight: 700;">Tactical Pitch: {selected_label} <span style="font-size: 1rem; color: #64748b; font-weight: 400;">[{timeframe}]</span></h2>
+    <span style="background: rgba({ '16, 185, 129' if in_possession else '239, 68, 68' }, 0.15); 
+                 color: {status_color}; 
+                 border: 1px solid {status_color}; 
+                 padding: 5px 14px; 
+                 border-radius: 20px; 
+                 font-size: 0.8rem; 
+                 font-weight: 700; 
+                 letter-spacing: 0.05em;">
+        {status_text}
+    </span>
+</div>
+""", unsafe_allow_html=True)
+
+# Metrics Quad-Display
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Live Price", price_fmt)
+c1.metric("Live Market Price", price_fmt)
 c2.metric("Possession", "ATTACKING" if in_possession else "DEFENDING", delta="Above 200 EMA" if in_possession else "-Below 200 EMA")
 c3.metric("Defensive Stop", f"{stop_metric:.1f} {metric_label}", f"Target: +{stop_metric * 2:.1f} (1:2)")
 c4.metric("Strict Sizing (OANDA)", sizing_label, f"Margin: ${required_margin:,.0f} ({int(1/margin_rate)}:1)")
 
-# 8. Active Directive Box
+# 9. Active Directive Box
 if active_buy_signal and session_ok:
     sl_price = latest['Close'] - stop_distance_price
     tp_price = latest['Close'] + (stop_distance_price * 2.0)
@@ -284,7 +388,7 @@ elif (active_buy_signal or active_sell_signal) and not session_ok:
     ### ⏸️ DIRECTIVE PAUSED: OFF-HOURS / LOW LIQUIDITY
     * **Technical Setup Met:** Technical conditions fired on chart.
     * **Session Guard:** Blocked because **{selected_label}** trades during **{session_name}**.
-    * **Reason:** Current time ({now_est.strftime('%H:%M EST')}) has minimal institutional liquidity. Spreads can widen and price will stall. Wait for active session open.
+    * **Reason:** Current time ({now_est.strftime('%H:%M EST')}) has minimal institutional volume. Spreads can widen and price will stall. Wait for active session open.
     """)
 else:
     dist_to_ema20 = abs(latest['Close'] - latest['Tempo_20EMA']) / pip_scale
@@ -295,11 +399,8 @@ else:
     * **Session Status:** {session_name} ({'Active' if session_ok else 'Closed / Low Volume'}).
     """)
 
-# =========================================================
-# 9. 🤖 AI ASSISTANT MANAGER (TACTICAL DEBRIEF - PERSISTENT)
-# =========================================================
+# 10. AI Assistant Manager (Persistent Debrief)
 st.write("---")
-
 if "ai_briefings" not in st.session_state:
     st.session_state.ai_briefings = {}
 
@@ -384,16 +485,25 @@ with st.expander("🤖 AI Assistant Manager (Tactical Debrief)", expanded=True):
         st.caption(f"{badge} | Delivered at {briefing_data['timestamp']}")
         st.markdown(briefing_data["text"])
 
-# 10. Interactive Chart
-fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
+# 11. Interactive Stadium Pitch Chart
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.75, 0.25])
 
 fig.add_trace(go.Candlestick(
     x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
     name="Price"
 ), row=1, col=1)
 
-fig.add_trace(go.Scatter(x=df.index, y=df['Midfield_200EMA'], line=dict(color='#eab308', width=2), name="Midfield (200 EMA)"), row=1, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df['Tempo_20EMA'], line=dict(color='#38bdf8', width=1.5, dash='dot'), name="Tempo (20 EMA)"), row=1, col=1)
+fig.add_trace(go.Scatter(
+    x=df.index, y=df['Midfield_200EMA'], 
+    line=dict(color='#eab308', width=2), 
+    name="Midfield (200 EMA)"
+), row=1, col=1)
+
+fig.add_trace(go.Scatter(
+    x=df.index, y=df['Tempo_20EMA'], 
+    line=dict(color='#38bdf8', width=1.5, dash='dot'), 
+    name="Tempo (20 EMA)"
+), row=1, col=1)
 
 buy_plays = df[df['Striker_Buy']]
 fig.add_trace(go.Scatter(
@@ -409,20 +519,38 @@ fig.add_trace(go.Scatter(
     name="Sell Entry"
 ), row=1, col=1)
 
-fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='#c084fc', width=1.5), name="RSI Stamina"), row=2, col=1)
+fig.add_trace(go.Scatter(
+    x=df.index, y=df['RSI'], 
+    line=dict(color='#c084fc', width=1.5), 
+    name="RSI Stamina"
+), row=2, col=1)
+
 fig.add_hline(y=70, line_dash="dash", line_color="#ef4444", row=2, col=1)
 fig.add_hline(y=30, line_dash="dash", line_color="#22c55e", row=2, col=1)
 
 fig.update_layout(
     template="plotly_dark",
+    paper_bgcolor="#0b0f19",
+    plot_bgcolor="#080c14",
     xaxis_rangeslider_visible=False,
     height=680,
-    margin=dict(l=20, r=20, t=20, b=20),
-    uirevision=pair
+    margin=dict(l=15, r=15, t=10, b=15),
+    uirevision=pair,
+    legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.02,
+        xanchor="right",
+        x=1,
+        font=dict(size=11, color="#94a3b8"),
+        bgcolor="rgba(0,0,0,0)"
+    )
 )
+
+fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(255, 255, 255, 0.04)")
+fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(255, 255, 255, 0.04)")
 
 if not is_crypto:
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
-
