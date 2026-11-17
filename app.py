@@ -18,14 +18,11 @@ refresh_cycle = st_autorefresh(interval=20000, limit=2000, key="fx_stream_sync")
 # 2. Tactical War Room CSS
 st.markdown("""
 <style>
-    /* Global Base */
     .stApp {
         background-color: #0b0f19;
         color: #f3f4f6;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
-
-    /* Metric Cards - Tactical Stat Board */
     div[data-testid="stMetric"] {
         background: linear-gradient(135deg, rgba(17, 24, 39, 0.85) 0%, rgba(15, 23, 42, 0.65) 100%);
         border: 1px solid rgba(255, 255, 255, 0.08);
@@ -51,8 +48,6 @@ st.markdown("""
         font-weight: 700 !important;
         color: #f8fafc !important;
     }
-
-    /* Sidebar Styling */
     section[data-testid="stSidebar"] {
         background-color: #080c14 !important;
         border-right: 1px solid rgba(255, 255, 255, 0.06);
@@ -64,16 +59,12 @@ st.markdown("""
         letter-spacing: 0.05em;
         text-transform: uppercase;
     }
-
-    /* Expander Panels */
     div[data-testid="stExpander"] {
         background: rgba(15, 23, 42, 0.55) !important;
         border: 1px solid rgba(255, 255, 255, 0.08) !important;
         border-radius: 12px !important;
         overflow: hidden;
     }
-
-    /* Primary Action Buttons */
     .stButton>button {
         border-radius: 8px;
         background: linear-gradient(135deg, #059669 0%, #10b981 100%);
@@ -88,8 +79,6 @@ st.markdown("""
         box-shadow: 0 4px 16px rgba(16, 185, 129, 0.5);
         transform: translateY(-1px);
     }
-
-    /* Dataframe Polish */
     div[data-testid="stDataFrame"] {
         border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: 10px;
@@ -114,7 +103,7 @@ FOREX_ROSTER = {
     "Bitcoin (BTC/USD)": "BTC-USD"
 }
 
-# 4. Sidebar Tactical Controls
+# 4. Sidebar Controls
 st.sidebar.title("Tactical Room")
 timeframe = st.sidebar.selectbox(
     "Match Timeframe", 
@@ -153,7 +142,7 @@ def is_session_active(ticker_label):
         return active, "Tokyo / Asian Session"
     return True, "Open Liquidity"
 
-# 6. Data Ingestion & Technical Processing
+# 6. Data Ingestion & Technical Calculations
 period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
 fetch_period = period_map.get(timeframe, "10d")
 
@@ -299,7 +288,6 @@ if is_crypto:
     stop_distance_price = latest['ATR_14'] * 1.5
     stop_metric = stop_distance_price
     metric_label = "USD ($)"
-    
     risk_dollars = account_nav * risk_pct
     allowed_standard_lots = risk_dollars / stop_distance_price
     required_margin = allowed_standard_lots * latest['Close'] * margin_rate
@@ -331,7 +319,6 @@ in_possession = bool(latest['Close'] > latest['Midfield_200EMA'])
 active_buy_signal = bool(latest['Striker_Buy'])
 active_sell_signal = bool(latest['Striker_Sell'])
 
-# Styled Header Badge
 status_color = "#10b981" if in_possession else "#ef4444"
 status_text = "POSSESSION (ATTACKING)" if in_possession else "DEFENDING (COUNTER-ATTACK)"
 
@@ -351,7 +338,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Metrics Quad-Display
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Live Market Price", price_fmt)
 c2.metric("Possession", "ATTACKING" if in_possession else "DEFENDING", delta="Above 200 EMA" if in_possession else "-Below 200 EMA")
@@ -399,7 +385,7 @@ else:
     * **Session Status:** {session_name} ({'Active' if session_ok else 'Closed / Low Volume'}).
     """)
 
-# 10. AI Assistant Manager (Persistent Debrief)
+# 10. AI Assistant Manager
 st.write("---")
 if "ai_briefings" not in st.session_state:
     st.session_state.ai_briefings = {}
@@ -554,3 +540,97 @@ if not is_crypto:
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
+
+# =========================================================
+# 12. 📊 HISTORICAL MATCH LOG & WIN-RATE BACKTEST ENGINE
+# =========================================================
+st.write("---")
+st.subheader(f"Tactical Match Performance & Win Rate: {selected_label} [{timeframe}]")
+
+def calculate_historical_performance(df, is_crypto, is_jpy):
+    trades = []
+    pip_scale = 1.0 if is_crypto else (0.01 if is_jpy else 0.0001)
+
+    # Need at least 50 candles for indicators to stabilize
+    for i in range(50, len(df) - 1):
+        row = df.iloc[i]
+        is_buy = bool(row['Striker_Buy'])
+        is_sell = bool(row['Striker_Sell'])
+
+        if not (is_buy or is_sell):
+            continue
+
+        entry_price = row['Close']
+        raw_stop = (row['ATR_14'] * 1.5) / pip_scale
+        stop_units = max(raw_stop, 8.0) if not is_crypto else (row['ATR_14'] * 1.5)
+        stop_dist = stop_units * pip_scale
+        tp_dist = stop_dist * 2.0  # Strict 1:2 tactical target
+
+        sl_price = entry_price - stop_dist if is_buy else entry_price + stop_dist
+        tp_price = entry_price + tp_dist if is_buy else entry_price - tp_dist
+
+        outcome = "OPEN"
+        exit_price = None
+        exit_time = None
+
+        # Walk forward through subsequent candles to test the system's call
+        for j in range(i + 1, len(df)):
+            future_bar = df.iloc[j]
+            if is_buy:
+                if future_bar['Low'] <= sl_price:
+                    outcome = "LOSS"
+                    exit_price = sl_price
+                    exit_time = future_bar.name
+                    break
+                elif future_bar['High'] >= tp_price:
+                    outcome = "WIN"
+                    exit_price = tp_price
+                    exit_time = future_bar.name
+                    break
+            elif is_sell:
+                if future_bar['High'] >= sl_price:
+                    outcome = "LOSS"
+                    exit_price = sl_price
+                    exit_time = future_bar.name
+                    break
+                elif future_bar['Low'] <= tp_price:
+                    outcome = "WIN"
+                    exit_price = tp_price
+                    exit_time = future_bar.name
+                    break
+
+        trades.append({
+            "Match Time": row.name.strftime('%Y-%m-%d %H:%M'),
+            "Tactic": "BUY" if is_buy else "SELL",
+            "Entry": round(entry_price, p_dec),
+            "Stop Loss": round(sl_price, p_dec),
+            "Target (1:2)": round(tp_price, p_dec),
+            f"Risk ({metric_label})": round(stop_units, 1),
+            "Result": outcome,
+            "R-Return": "+2.0 R" if outcome == "WIN" else ("-1.0 R" if outcome == "LOSS" else "Active")
+        })
+
+    return pd.DataFrame(trades)
+
+perf_df = calculate_historical_performance(df, is_crypto, is_jpy)
+
+if not perf_df.empty:
+    completed = perf_df[perf_df['Result'].isin(['WIN', 'LOSS'])]
+    total_completed = len(completed)
+    wins = len(completed[completed['Result'] == 'WIN'])
+    losses = len(completed[completed['Result'] == 'LOSS'])
+    win_rate = (wins / total_completed * 100) if total_completed > 0 else 0.0
+    net_r = (wins * 2.0) - (losses * 1.0)
+
+    # Historical Performance Quad-Cards
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Historical Setups", f"{len(perf_df)} Calls", f"{total_completed} Completed")
+    b2.metric("Tactical Win Rate", f"{win_rate:.1f}%", f"{wins}W - {losses}L")
+    b3.metric("Net Expectancy", f"{net_r:+.1f} R", delta="Net Positive" if net_r > 0 else "-Drawdown")
+    b4.metric("Risk-to-Reward Profile", "1 : 2.0", "Asymmetric Target")
+
+    with st.expander(f"Detailed Match Call Log ({len(perf_df)} Total Plays)", expanded=False):
+        st.dataframe(perf_df.iloc[::-1], use_container_width=True, hide_index=True)
+else:
+    st.info("No completed tactical calls found in the current candle sample window. Switch timeframes to inspect longer horizons.")
+
