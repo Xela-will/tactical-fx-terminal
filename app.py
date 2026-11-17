@@ -5,6 +5,8 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
+from datetime import datetime
+import pytz
 
 # 1. Page Configuration
 st.set_page_config(page_title="Tactical FX Terminal", layout="wide")
@@ -44,7 +46,34 @@ max_margin_pct = st.sidebar.slider("Max Collateral Allowed (%)", min_value=5, ma
 
 st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Status: Connected")
 
-# 4. Data Fetching & Indicator Processor
+# 4. Session Liquidity Filter (EST Timezone)
+est_tz = pytz.timezone("US/Eastern")
+now_est = datetime.now(est_tz)
+current_hour_est = now_est.hour + (now_est.minute / 60.0)
+
+def is_session_active(ticker_label):
+    # Crypto trades 24/7
+    if "BTC" in ticker_label:
+        return True, "Crypto 24/7"
+    
+    # European pairs (EUR, GBP, CHF) -> London & early NY (03:00 - 12:00 EST)
+    if any(k in ticker_label for k in ["EUR", "GBP", "CHF"]) and "USD" not in ticker_label and "JPY" not in ticker_label:
+        active = (3.0 <= current_hour_est <= 12.0)
+        return active, "London Core (03:00 - 12:00 EST)"
+    
+    # USD / CAD / Gold -> US Market (08:00 - 16:30 EST)
+    if any(k in ticker_label for k in ["USD", "CAD", "GC=F"]):
+        active = (8.0 <= current_hour_est <= 16.3) or (3.0 <= current_hour_est <= 11.5)
+        return active, "NY / London Overlap (08:00 - 16:30 EST)"
+    
+    # Asian / Pacific pairs (JPY, AUD, NZD) -> Tokyo / Sydney (19:00 - 03:00 EST)
+    if any(k in ticker_label for k in ["JPY", "AUD", "NZD"]):
+        active = (current_hour_est >= 19.0 or current_hour_est <= 4.0) or (3.0 <= current_hour_est <= 11.5)
+        return active, "Tokyo / London Active"
+    
+    return True, "Open Liquidity"
+
+# 5. Data Fetching & Indicator Processor
 period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
 fetch_period = period_map.get(timeframe, "10d")
 
@@ -52,7 +81,6 @@ def process_indicators(df):
     if df is None or len(df) < 50:
         return None
     df = df.copy()
-    # Indicators
     df['Midfield_200EMA'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['Tempo_20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
 
@@ -108,8 +136,9 @@ def scan_all_markets(roster, interval, period):
 
 market_data = scan_all_markets(FOREX_ROSTER, timeframe, fetch_period)
 
-# 5. TACTICAL RADAR (LIVE ROSTER SCANNER)
+# 6. TACTICAL RADAR (LIVE ROSTER SCANNER)
 st.title("Tactical Radar: All-Pitch Scanner")
+st.caption(f"Current Pitch Clock: {now_est.strftime('%H:%M:%S EST')} (New York Time)")
 
 radar_records = []
 active_buys = []
@@ -120,54 +149,59 @@ for label, df_item in market_data.items():
     sym = FOREX_ROSTER[label]
     is_jpy = "JPY" in sym
     is_crypto = "BTC" in sym
-    is_gold = "GC=F" in sym
+    session_ok, session_name = is_session_active(label)
 
-    # Scaling
     pip_scale = 1.0 if is_crypto else (0.01 if is_jpy else 0.0001)
-    stop_dist = latest['ATR_14'] * 1.5
-    stop_units = stop_dist if is_crypto else (stop_dist / pip_scale)
+    
+    # Enforce minimum 8.0 pip defensive floor
+    raw_stop = (latest['ATR_14'] * 1.5) / pip_scale
+    stop_units = max(raw_stop, 8.0) if not is_crypto else (latest['ATR_14'] * 1.5)
 
     status = "STANDBY"
     if bool(latest['Striker_Buy']):
-        status = "🟢 BUY"
-        active_buys.append(label)
+        if session_ok:
+            status = "🟢 BUY"
+            active_buys.append(label)
+        else:
+            status = "⏸️ BUY (Off-Hours)"
     elif bool(latest['Striker_Sell']):
-        status = "🔴 SELL"
-        active_sells.append(label)
+        if session_ok:
+            status = "🔴 SELL"
+            active_sells.append(label)
+        else:
+            status = "⏸️ SELL (Off-Hours)"
 
     p_dec = 1 if is_crypto else (3 if is_jpy else 5)
     radar_records.append({
         "Instrument": label,
         "Signal": status,
+        "Session State": "Active" if session_ok else "Closed / Illiquid",
         "Price": f"{latest['Close']:.{p_dec}f}",
         "Possession": "Attacking" if latest['Close'] > latest['Midfield_200EMA'] else "Defending",
         "RSI": f"{latest['RSI']:.1f}",
         f"Stop ({'USD' if is_crypto else 'Pips'})": f"{stop_units:.1f}"
     })
 
-# Summary notification bar
 if active_buys or active_sells:
     alert_msg = []
     if active_buys:
-        alert_msg.append(f"🟢 **BUY SIGNAL(S):** {', '.join(active_buys)}")
+        alert_msg.append(f"🟢 **LIVE BUY:** {', '.join(active_buys)}")
     if active_sells:
-        alert_msg.append(f"🔴 **SELL SIGNAL(S):** {', '.join(active_sells)}")
+        alert_msg.append(f"🔴 **LIVE SELL:** {', '.join(active_sells)}")
     st.success(" | ".join(alert_msg))
 else:
-    st.info("🟡 **Radar Clean:** No instruments currently in strike zone. All squads maintaining defensive posture.")
+    st.info("🟡 **Radar Clean:** No instruments in strike zone during active market sessions.")
 
-# Radar Overview Grid
 with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
     radar_df = pd.DataFrame(radar_records)
     if not radar_df.empty:
-        # Sort so active directives float to the top
-        radar_df['Rank'] = radar_df['Signal'].apply(lambda x: 0 if "BUY" in x or "SELL" in x else 1)
+        radar_df['Rank'] = radar_df['Signal'].apply(lambda x: 0 if ("🟢" in x or "🔴" in x) else (1 if "⏸️" in x else 2))
         radar_df = radar_df.sort_values(by=['Rank', 'Instrument']).drop(columns=['Rank'])
         st.dataframe(radar_df, use_container_width=True, hide_index=True)
 
 st.write("---")
 
-# 6. DETAILED TACTICAL PITCH INSPECTOR
+# 7. DETAILED TACTICAL PITCH INSPECTOR
 selected_label = st.selectbox(
     "Select Pitch to Inspect in Detail:",
     list(market_data.keys()),
@@ -177,6 +211,7 @@ selected_label = st.selectbox(
 df = market_data[selected_label]
 pair = FOREX_ROSTER[selected_label]
 latest = df.iloc[-1]
+session_ok, session_name = is_session_active(selected_label)
 
 # Sizing and Margin Calculations
 is_jpy = "JPY" in pair
@@ -198,8 +233,11 @@ else:
     pip_scale = 0.01 if is_jpy else 0.0001
     margin_rate = 0.05 if (is_jpy or is_gold) else 0.02
     metric_label = "Pips"
-    stop_distance_price = latest['ATR_14'] * 1.5
-    stop_metric = stop_distance_price / pip_scale
+    
+    # 8.0 pip defensive floor prevents spread-out traps
+    raw_pips = (latest['ATR_14'] * 1.5) / pip_scale
+    stop_metric = max(raw_pips, 8.0)
+    stop_distance_price = stop_metric * pip_scale
 
     pip_value_std_lot = (pip_scale / latest['Close']) * 100_000 if is_jpy else 10.0
     risk_dollars = account_nav * risk_pct
@@ -209,7 +247,8 @@ else:
     margin_per_lot = 100000.0 * margin_rate
     lots_by_margin = max_margin_dollars / margin_per_lot
 
-    allowed_standard_lots = min(lots_by_risk, lots_by_margin)
+    # Cap maximum allowed standard lots to 10.0 to prevent over-leverage
+    allowed_standard_lots = min(lots_by_risk, lots_by_margin, 10.0)
     required_margin = allowed_standard_lots * margin_per_lot
     sizing_label = f"{allowed_standard_lots:.2f} Standard Lots"
 
@@ -227,8 +266,8 @@ c2.metric("Possession", "ATTACKING" if in_possession else "DEFENDING", delta="Ab
 c3.metric("Defensive Stop", f"{stop_metric:.1f} {metric_label}", f"Target: +{stop_metric * 2:.1f} (1:2)")
 c4.metric("Strict Sizing (OANDA)", sizing_label, f"Margin: ${required_margin:,.0f} ({int(1/margin_rate)}:1)")
 
-# Directives Box
-if active_buy_signal:
+# Directives Box with Session Guard
+if active_buy_signal and session_ok:
     sl_price = latest['Close'] - stop_distance_price
     tp_price = latest['Close'] + (stop_distance_price * 2.0)
     st.success(f"""
@@ -238,9 +277,9 @@ if active_buy_signal:
     * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (+{stop_metric * 2:.1f} {metric_label} | 1:2 R:R)
     * **Suggested Sizing:** `{sizing_label}`
-    * **Tactical Confirmation:** Above 200 EMA + Pullback to 20 EMA touched + RSI primed ({latest['RSI']:.1f})
+    * **Tactical Confirmation:** Above 200 EMA + Retest 20 EMA + RSI primed ({latest['RSI']:.1f})
     """)
-elif active_sell_signal:
+elif active_sell_signal and session_ok:
     sl_price = latest['Close'] + stop_distance_price
     tp_price = latest['Close'] - (stop_distance_price * 2.0)
     st.error(f"""
@@ -250,15 +289,22 @@ elif active_sell_signal:
     * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (-{stop_metric * 2:.1f} {metric_label} | 1:2 R:R)
     * **Suggested Sizing:** `{sizing_label}`
-    * **Tactical Confirmation:** Below 200 EMA + Rally to 20 EMA touched + RSI primed ({latest['RSI']:.1f})
+    * **Tactical Confirmation:** Below 200 EMA + Rally 20 EMA + RSI primed ({latest['RSI']:.1f})
+    """)
+elif (active_buy_signal or active_sell_signal) and not session_ok:
+    st.warning(f"""
+    ### ⏸️ DIRECTIVE PAUSED: OFF-HOURS / LOW LIQUIDITY
+    * **Technical Condition Met:** A technical entry fired on the chart.
+    * **Session Guard:** Blocked because **{selected_label}** trades during **{session_name}**.
+    * **Reason:** Current hour ({now_est.strftime('%H:%M EST')}) has minimal institutional market volume. Spreads can widen and price will stall. Wait for active session open.
     """)
 else:
     dist_to_ema20 = abs(latest['Close'] - latest['Tempo_20EMA']) / pip_scale
-    st.warning(f"""
+    st.info(f"""
     ### 🟡 TACTICAL DIRECTIVE: STAND BY (PATIENT POSSESSION)
     * **Status:** No trigger on active candle. Maintain position discipline.
     * **Tactical Read:** Retest at 20 EMA is {dist_to_ema20:.1f} {metric_label} away at `{latest['Tempo_20EMA']:.{p_dec}f}`. Current RSI: `{latest['RSI']:.1f}`.
-    * **Prepared Defensive Size:** If trigger fires, max allowed size is **{sizing_label}**.
+    * **Session Status:** {session_name} ({'Active' if session_ok else 'Closed / Low Volume'}).
     """)
 
 # Interactive Chart
@@ -272,7 +318,6 @@ fig.add_trace(go.Candlestick(
 fig.add_trace(go.Scatter(x=df.index, y=df['Midfield_200EMA'], line=dict(color='#eab308', width=2), name="Midfield (200 EMA)"), row=1, col=1)
 fig.add_trace(go.Scatter(x=df.index, y=df['Tempo_20EMA'], line=dict(color='#38bdf8', width=1.5, dash='dot'), name="Tempo (20 EMA)"), row=1, col=1)
 
-# Buy markers
 buy_plays = df[df['Striker_Buy']]
 fig.add_trace(go.Scatter(
     x=buy_plays.index, y=buy_plays['Low'] * (0.999 if is_jpy or is_crypto else 0.9998),
@@ -280,7 +325,6 @@ fig.add_trace(go.Scatter(
     name="Buy Entry"
 ), row=1, col=1)
 
-# Sell markers
 sell_plays = df[df['Striker_Sell']]
 fig.add_trace(go.Scatter(
     x=sell_plays.index, y=sell_plays['High'] * (1.001 if is_jpy or is_crypto else 1.0002),
@@ -288,12 +332,10 @@ fig.add_trace(go.Scatter(
     name="Sell Entry"
 ), row=1, col=1)
 
-# RSI Pane
 fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='#c084fc', width=1.5), name="RSI Stamina"), row=2, col=1)
 fig.add_hline(y=70, line_dash="dash", line_color="#ef4444", row=2, col=1)
 fig.add_hline(y=30, line_dash="dash", line_color="#22c55e", row=2, col=1)
 
-# Layout: state preservation & conditional weekend breaks
 fig.update_layout(
     template="plotly_dark",
     xaxis_rangeslider_visible=False,
