@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 import pytz
+import os
 
 # 1. Page Configuration
 st.set_page_config(page_title="Tactical FX Terminal", layout="wide")
@@ -44,6 +45,10 @@ account_nav = st.sidebar.number_input("OANDA Balance / NAV ($)", value=798000.0,
 risk_pct = st.sidebar.slider("Cash Risk per Trade (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1) / 100.0
 max_margin_pct = st.sidebar.slider("Max Collateral Allowed (%)", min_value=5, max_value=40, value=20, step=5) / 100.0
 
+st.sidebar.write("---")
+st.sidebar.subheader("AI Intelligence Layer")
+sidebar_gemini_key = st.sidebar.text_input("Gemini API Key (Optional)", type="password", help="Leave blank if set in Streamlit Secrets")
+
 st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Status: Connected")
 
 # 4. Session Liquidity Filter (EST Timezone)
@@ -52,28 +57,20 @@ now_est = datetime.now(est_tz)
 current_hour_est = now_est.hour + (now_est.minute / 60.0)
 
 def is_session_active(ticker_label):
-    # Crypto trades 24/7
     if "BTC" in ticker_label:
         return True, "Crypto 24/7"
-    
-    # European pairs (EUR, GBP, CHF) -> London & early NY (03:00 - 12:00 EST)
     if any(k in ticker_label for k in ["EUR", "GBP", "CHF"]) and "USD" not in ticker_label and "JPY" not in ticker_label:
         active = (3.0 <= current_hour_est <= 12.0)
         return active, "London Core (03:00 - 12:00 EST)"
-    
-    # USD / CAD / Gold -> US Market (08:00 - 16:30 EST)
     if any(k in ticker_label for k in ["USD", "CAD", "GC=F"]):
         active = (8.0 <= current_hour_est <= 16.3) or (3.0 <= current_hour_est <= 11.5)
         return active, "NY / London Overlap (08:00 - 16:30 EST)"
-    
-    # Asian / Pacific pairs (JPY, AUD, NZD) -> Tokyo / Sydney (19:00 - 03:00 EST)
     if any(k in ticker_label for k in ["JPY", "AUD", "NZD"]):
         active = (current_hour_est >= 19.0 or current_hour_est <= 4.0) or (3.0 <= current_hour_est <= 11.5)
         return active, "Tokyo / London Active"
-    
     return True, "Open Liquidity"
 
-# 5. Data Fetching & Indicator Processor
+# 5. Data Fetching & Indicators
 period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
 fetch_period = period_map.get(timeframe, "10d")
 
@@ -84,21 +81,18 @@ def process_indicators(df):
     df['Midfield_200EMA'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['Tempo_20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
 
-    # Volatility / ATR (14)
     hl = df['High'] - df['Low']
     hc = (df['High'] - df['Close'].shift()).abs()
     lc = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df['ATR_14'] = tr.rolling(window=14).mean()
 
-    # RSI (14)
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # Signal Rules
     in_possession_bull = df['Close'] > df['Midfield_200EMA']
     pullback_to_box = (df['Low'] <= df['Tempo_20EMA']) & (df['Close'] >= df['Tempo_20EMA'] * 0.998)
     striker_primed_bull = (df['RSI'] >= 40) & (df['RSI'] <= 55)
@@ -136,9 +130,9 @@ def scan_all_markets(roster, interval, period):
 
 market_data = scan_all_markets(FOREX_ROSTER, timeframe, fetch_period)
 
-# 6. TACTICAL RADAR (LIVE ROSTER SCANNER)
+# 6. Tactical Radar Scanner
 st.title("Tactical Radar: All-Pitch Scanner")
-st.caption(f"Current Pitch Clock: {now_est.strftime('%H:%M:%S EST')} (New York Time)")
+st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} (New York Time)")
 
 radar_records = []
 active_buys = []
@@ -152,8 +146,6 @@ for label, df_item in market_data.items():
     session_ok, session_name = is_session_active(label)
 
     pip_scale = 1.0 if is_crypto else (0.01 if is_jpy else 0.0001)
-    
-    # Enforce minimum 8.0 pip defensive floor
     raw_stop = (latest['ATR_14'] * 1.5) / pip_scale
     stop_units = max(raw_stop, 8.0) if not is_crypto else (latest['ATR_14'] * 1.5)
 
@@ -175,7 +167,7 @@ for label, df_item in market_data.items():
     radar_records.append({
         "Instrument": label,
         "Signal": status,
-        "Session State": "Active" if session_ok else "Closed / Illiquid",
+        "Session State": "Active" if session_ok else "Closed / Low Liquidity",
         "Price": f"{latest['Close']:.{p_dec}f}",
         "Possession": "Attacking" if latest['Close'] > latest['Midfield_200EMA'] else "Defending",
         "RSI": f"{latest['RSI']:.1f}",
@@ -201,7 +193,7 @@ with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
 
 st.write("---")
 
-# 7. DETAILED TACTICAL PITCH INSPECTOR
+# 7. Detailed Pitch Inspector
 selected_label = st.selectbox(
     "Select Pitch to Inspect in Detail:",
     list(market_data.keys()),
@@ -213,7 +205,6 @@ pair = FOREX_ROSTER[selected_label]
 latest = df.iloc[-1]
 session_ok, session_name = is_session_active(selected_label)
 
-# Sizing and Margin Calculations
 is_jpy = "JPY" in pair
 is_crypto = "BTC" in pair
 is_gold = "GC=F" in pair
@@ -234,7 +225,6 @@ else:
     margin_rate = 0.05 if (is_jpy or is_gold) else 0.02
     metric_label = "Pips"
     
-    # 8.0 pip defensive floor prevents spread-out traps
     raw_pips = (latest['ATR_14'] * 1.5) / pip_scale
     stop_metric = max(raw_pips, 8.0)
     stop_distance_price = stop_metric * pip_scale
@@ -247,7 +237,6 @@ else:
     margin_per_lot = 100000.0 * margin_rate
     lots_by_margin = max_margin_dollars / margin_per_lot
 
-    # Cap maximum allowed standard lots to 10.0 to prevent over-leverage
     allowed_standard_lots = min(lots_by_risk, lots_by_margin, 10.0)
     required_margin = allowed_standard_lots * margin_per_lot
     sizing_label = f"{allowed_standard_lots:.2f} Standard Lots"
@@ -258,7 +247,6 @@ in_possession = bool(latest['Close'] > latest['Midfield_200EMA'])
 active_buy_signal = bool(latest['Striker_Buy'])
 active_sell_signal = bool(latest['Striker_Sell'])
 
-# Metrics Bar
 st.subheader(f"Tactical Pitch: {selected_label} [{timeframe}]")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Live Price", price_fmt)
@@ -266,7 +254,7 @@ c2.metric("Possession", "ATTACKING" if in_possession else "DEFENDING", delta="Ab
 c3.metric("Defensive Stop", f"{stop_metric:.1f} {metric_label}", f"Target: +{stop_metric * 2:.1f} (1:2)")
 c4.metric("Strict Sizing (OANDA)", sizing_label, f"Margin: ${required_margin:,.0f} ({int(1/margin_rate)}:1)")
 
-# Directives Box with Session Guard
+# 8. Active Directive Box
 if active_buy_signal and session_ok:
     sl_price = latest['Close'] - stop_distance_price
     tp_price = latest['Close'] + (stop_distance_price * 2.0)
@@ -294,9 +282,9 @@ elif active_sell_signal and session_ok:
 elif (active_buy_signal or active_sell_signal) and not session_ok:
     st.warning(f"""
     ### ⏸️ DIRECTIVE PAUSED: OFF-HOURS / LOW LIQUIDITY
-    * **Technical Condition Met:** A technical entry fired on the chart.
+    * **Technical Setup Met:** Technical conditions fired on chart.
     * **Session Guard:** Blocked because **{selected_label}** trades during **{session_name}**.
-    * **Reason:** Current hour ({now_est.strftime('%H:%M EST')}) has minimal institutional market volume. Spreads can widen and price will stall. Wait for active session open.
+    * **Reason:** Current time ({now_est.strftime('%H:%M EST')}) has minimal institutional liquidity. Spreads can widen and price will stall. Wait for active session open.
     """)
 else:
     dist_to_ema20 = abs(latest['Close'] - latest['Tempo_20EMA']) / pip_scale
@@ -307,7 +295,67 @@ else:
     * **Session Status:** {session_name} ({'Active' if session_ok else 'Closed / Low Volume'}).
     """)
 
-# Interactive Chart
+# =========================================================
+# 9. 🤖 AI ASSISTANT MANAGER (TACTICAL DEBRIEF)
+# =========================================================
+st.write("---")
+with st.expander("🤖 AI Assistant Manager (Tactical Debrief)", expanded=True):
+    col_ai_btn, col_ai_status = st.columns([1, 4])
+    run_ai = col_ai_btn.button("Generate Tactical Briefing")
+    
+    # Check for Gemini API Key in Secrets or Sidebar
+    active_gemini_key = sidebar_gemini_key or st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+
+    if run_ai:
+        if active_gemini_key:
+            try:
+                from google import genai
+                client = genai.Client(api_key=active_gemini_key)
+                
+                signal_label = "BUY" if (active_buy_signal and session_ok) else ("SELL" if (active_sell_signal and session_ok) else ("OFF_HOURS" if (active_buy_signal or active_sell_signal) else "STANDBY"))
+                
+                prompt = f"""
+                You are an elite quantitative football-themed FX risk manager and tactical analyst.
+                Evaluate this live market state:
+                - Instrument: {selected_label}
+                - Timeframe: {timeframe}
+                - Current Price: {latest['Close']:.{p_dec}f}
+                - Midfield 200 EMA: {latest['Midfield_200EMA']:.{p_dec}f} ({'Above' if in_possession else 'Below'})
+                - Tempo 20 EMA: {latest['Tempo_20EMA']:.{p_dec}f}
+                - RSI: {latest['RSI']:.1f}
+                - ATR Stop Distance: {stop_metric:.1f} {metric_label}
+                - Session: {session_name} ({'Active' if session_ok else 'Illiquid'})
+                - System Directive: {signal_label}
+
+                Provide a sharp, 3-point tactical debrief:
+                1. 🏟️ Pitch & Liquidity Condition (Does current market session support momentum?)
+                2. ⚽ Tactical Setup Evaluation (Is this a high-quality strike or a false breakout/trap?)
+                3. 🛡️ Defensive Command (Actionable directive on whether to execute, wait, or protect capital)
+                Keep it disciplined, direct, and under 150 words.
+                """
+                with st.spinner("AI analyzing tactical pitch and liquidity depth..."):
+                    res = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt
+                    )
+                    st.markdown(res.text)
+            except Exception as e:
+                st.error(f"AI connection error: {str(e)}")
+        else:
+            # Algorithmic fallback if no API key is provided
+            st.info("💡 *No Gemini API Key detected. Using local algorithmic tactical debrief (add key in sidebar or Streamlit Secrets for full LLM analysis):*")
+            
+            # Rule-based algorithmic evaluation
+            spread_risk = "High spread penalty risk" if stop_metric < 12.0 else "Healthy buffer over spread"
+            momentum_state = "Overbought" if latest['RSI'] > 65 else ("Oversold" if latest['RSI'] < 35 else "Balanced momentum")
+            
+            st.markdown(f"""
+            * **🏟️ Liquidity & Pitch Status:** Market session is **{session_name}** ({'Open with institutional backing' if session_ok else 'Illiquid off-hours; high risk of stalled price'}).
+            * **⚽ Momentum & Value:** RSI stands at **{latest['RSI']:.1f}** ({momentum_state}). Price is {'controlling macro midfield above the 200 EMA' if in_possession else 'pinned back under the defensive 200 EMA line'}.
+            * **🛡️ Defensive Verdict:** Stop distance is **{stop_metric:.1f} {metric_label}** ({spread_risk}). Sizing strictly capped at **{sizing_label}**. Maintain adherence to the active directive box above.
+            """)
+
+# 10. Interactive Chart
 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
 
 fig.add_trace(go.Candlestick(
@@ -348,5 +396,3 @@ if not is_crypto:
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
-
-
