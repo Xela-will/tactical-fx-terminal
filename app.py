@@ -12,14 +12,38 @@ st.set_page_config(page_title="Tactical FX Terminal", layout="wide")
 # Polling engine: Auto-refreshes every 15 seconds (15,000 ms)
 refresh_cycle = st_autorefresh(interval=15000, limit=2000, key="fx_stream_sync")
 
-# 2. Sidebar Tactical Controls
+# 2. Comprehensive Forex Watchlist
+FOREX_ROSTER = {
+    # Majors
+    "USD/JPY": "USDJPY=X",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "USD/CHF": "USDCHF=X",
+    "NZD/USD": "NZDUSD=X",
+    # Crosses / Minors
+    "GBP/JPY": "GBPJPY=X",
+    "EUR/JPY": "EURJPY=X",
+    "EUR/GBP": "EURGBP=X",
+    "AUD/JPY": "AUDJPY=X",
+    "CAD/JPY": "CADJPY=X",
+    "EUR/AUD": "EURAUD=X",
+    # Commodities / Crypto
+    "Gold (GC=F)": "GC=F",
+    "Bitcoin (BTC/USD)": "BTC-USD"
+}
+
+# 3. Sidebar Tactical Controls
 st.sidebar.title("Tactical Room")
-pair = st.sidebar.selectbox(
-    "Active Instrument",
-    ["USDJPY=X", "EURUSD=X", "GBPUSD=X", "GBPJPY=X", "GC=F"],
-    index=0
+selected_label = st.sidebar.selectbox("Active Instrument", list(FOREX_ROSTER.keys()), index=0)
+pair = FOREX_ROSTER[selected_label]
+
+timeframe = st.sidebar.selectbox(
+    "Match Timeframe", 
+    ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], 
+    index=2  # Defaults to 15m for cleaner structure
 )
-timeframe = st.sidebar.selectbox("Match Timeframe", ["5m", "15m", "1h"], index=0)
 
 st.sidebar.write("---")
 st.sidebar.subheader("Account & Risk Settings")
@@ -27,20 +51,24 @@ account_nav = st.sidebar.number_input("OANDA Balance / NAV ($)", value=798000.0,
 risk_pct = st.sidebar.slider("Cash Risk per Trade (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1) / 100.0
 max_margin_pct = st.sidebar.slider("Max Collateral Allowed (%)", min_value=5, max_value=40, value=20, step=5) / 100.0
 
-st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Feed: Active")
+st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Status: Connected")
 
-# 3. Market Data Ingestion
+# 4. Market Data Ingestion
+# Determine fetch period based on timeframe to optimize download speed
+period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
+fetch_period = period_map.get(timeframe, "10d")
+
 @st.cache_data(ttl=12)
-def load_market_data(ticker, interval):
-    df = yf.download(ticker, period="5d", interval=interval, progress=False)
+def load_market_data(ticker, interval, period):
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
 
-df = load_market_data(pair, timeframe)
+df = load_market_data(pair, timeframe, fetch_period)
 
 if df is not None and not df.empty:
-    # 4. Technical Indicators
+    # 5. Technical Indicators
     df['Midfield_200EMA'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['Tempo_20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
 
@@ -59,43 +87,48 @@ if df is not None and not df.empty:
     df['RSI'] = 100 - (100 / (1 + rs))
 
     # Tactical Rules
-    in_possession = df['Close'] > df['Midfield_200EMA']
+    in_possession_series = df['Close'] > df['Midfield_200EMA']
     pullback_to_box = (df['Low'] <= df['Tempo_20EMA']) & (df['Close'] >= df['Tempo_20EMA'] * 0.998)
     striker_primed = (df['RSI'] >= 40) & (df['RSI'] <= 55)
-    df['Striker_Buy'] = in_possession & pullback_to_box & striker_primed
+    df['Striker_Buy'] = in_possession_series & pullback_to_box & striker_primed
 
-    # 5. OANDA Defensive Math (With 20:1 Leverage Check)
+    # 6. OANDA Defensive Math
     latest = df.iloc[-1]
     is_jpy = "JPY" in pair
     pip_scale = 0.01 if is_jpy else 0.0001
-    margin_rate = 0.05 if is_jpy else 0.02  # 20:1 for JPY (5%), 50:1 for EUR/GBP (2%)
+    
+    # OANDA Margin requirement: 5% (20:1) for JPY pairs / metals, 2% (50:1) for standard majors
+    margin_rate = 0.05 if (is_jpy or "GC=F" in pair) else 0.02
 
     stop_distance_price = latest['ATR_14'] * 1.5
     stop_pips = stop_distance_price / pip_scale
 
-    # Dollar value of 1 pip for 1 standard lot (100,000 units)
+    # Pip value calculation per standard lot
     pip_value_std_lot = (pip_scale / latest['Close']) * 100_000 if is_jpy else 10.0
 
     # Risk-based lot sizing
     risk_dollars = account_nav * risk_pct
     lots_by_risk = risk_dollars / (stop_pips * pip_value_std_lot)
 
-    # Margin-cap lot sizing (prevents tying up too much collateral)
+    # Margin-capped lot sizing
     max_margin_dollars = account_nav * max_margin_pct
-    notional_per_lot = 100000.0  # standard lot
+    notional_per_lot = 100000.0
     margin_per_lot = notional_per_lot * margin_rate
     lots_by_margin = max_margin_dollars / margin_per_lot
 
-    # Final bounded sizing
+    # Bounded allowed lots
     allowed_standard_lots = min(lots_by_risk, lots_by_margin)
     required_margin = allowed_standard_lots * margin_per_lot
 
     suggested_stop = latest['Close'] - stop_distance_price
     take_profit = latest['Close'] + (stop_distance_price * 2.0)
+    
+    # Evaluated explicitly as a single boolean to prevent Series ambiguity
+    in_possession = bool(latest['Close'] > latest['Midfield_200EMA'])
 
-    # 6. Top Metrics Bar
+    # 7. Top Metrics Bar
     price_fmt = f"{latest['Close']:.3f}" if is_jpy else f"{latest['Close']:.5f}"
-    st.title(f"Tactical Pitch: {pair} [{timeframe}]")
+    st.title(f"Tactical Pitch: {selected_label} [{timeframe}]")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Live Market Price", price_fmt)
@@ -112,10 +145,10 @@ if df is not None and not df.empty:
     c4.metric(
         "Strict Sizing (OANDA)", 
         f"{allowed_standard_lots:.2f} Lots", 
-        f"Margin: ${required_margin:,.0f} ({margin_rate*100:.0f}:1)"
+        f"Margin: ${required_margin:,.0f} ({int(1/margin_rate)}:1)"
     )
 
-    # 7. Interactive Multi-Pane Plotly Chart
+    # 8. Interactive Plotly Pitch
     fig = make_subplots(
         rows=2, cols=1, 
         shared_xaxes=True, 
@@ -123,13 +156,11 @@ if df is not None and not df.empty:
         row_heights=[0.75, 0.25]
     )
 
-    # Candlestick chart
     fig.add_trace(go.Candlestick(
         x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
         name="Price"
     ), row=1, col=1)
 
-    # Midfield & Tempo Lines
     fig.add_trace(go.Scatter(x=df.index, y=df['Midfield_200EMA'], line=dict(color='#eab308', width=2), name="Midfield (200 EMA)"), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['Tempo_20EMA'], line=dict(color='#38bdf8', width=1.5, dash='dot'), name="Tempo (20 EMA)"), row=1, col=1)
 
@@ -158,3 +189,5 @@ if df is not None and not df.empty:
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.warning("Awaiting market data connection...")
+
+
