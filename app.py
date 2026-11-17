@@ -9,32 +9,26 @@ from streamlit_autorefresh import st_autorefresh
 # 1. Page Configuration
 st.set_page_config(page_title="Tactical FX Terminal", layout="wide")
 
-# Polling engine: Auto-refreshes every 15 seconds (15,000 ms)
+# Polling engine: Auto-refreshes every 15 seconds
 refresh_cycle = st_autorefresh(interval=15000, limit=2000, key="fx_stream_sync")
 
-# 2. Comprehensive Forex Watchlist
+# 2. Watchlist Roster
 FOREX_ROSTER = {
-    # Majors
+    "USD/CAD": "USDCAD=X",
     "USD/JPY": "USDJPY=X",
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "USDCAD=X",
     "USD/CHF": "USDCHF=X",
     "NZD/USD": "NZDUSD=X",
-    # Crosses / Minors
     "GBP/JPY": "GBPJPY=X",
     "EUR/JPY": "EURJPY=X",
     "EUR/GBP": "EURGBP=X",
-    "AUD/JPY": "AUDJPY=X",
-    "CAD/JPY": "CADJPY=X",
-    "EUR/AUD": "EURAUD=X",
-    # Commodities / Crypto
     "Gold (GC=F)": "GC=F",
     "Bitcoin (BTC/USD)": "BTC-USD"
 }
 
-# 3. Sidebar Tactical Controls
+# 3. Sidebar Controls
 st.sidebar.title("Tactical Room")
 selected_label = st.sidebar.selectbox("Active Instrument", list(FOREX_ROSTER.keys()), index=0)
 pair = FOREX_ROSTER[selected_label]
@@ -42,7 +36,7 @@ pair = FOREX_ROSTER[selected_label]
 timeframe = st.sidebar.selectbox(
     "Match Timeframe", 
     ["1m", "5m", "15m", "30m", "1h", "4h", "1d"], 
-    index=2  # Defaults to 15m for cleaner structure
+    index=2
 )
 
 st.sidebar.write("---")
@@ -53,8 +47,7 @@ max_margin_pct = st.sidebar.slider("Max Collateral Allowed (%)", min_value=5, ma
 
 st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Status: Connected")
 
-# 4. Market Data Ingestion
-# Determine fetch period based on timeframe to optimize download speed
+# 4. Data Ingestion
 period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
 fetch_period = period_map.get(timeframe, "10d")
 
@@ -86,75 +79,93 @@ if df is not None and not df.empty:
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # Tactical Rules
-    in_possession_series = df['Close'] > df['Midfield_200EMA']
+    # Tactical Setup Definitions
+    in_possession_bull = df['Close'] > df['Midfield_200EMA']
     pullback_to_box = (df['Low'] <= df['Tempo_20EMA']) & (df['Close'] >= df['Tempo_20EMA'] * 0.998)
-    striker_primed = (df['RSI'] >= 40) & (df['RSI'] <= 55)
-    df['Striker_Buy'] = in_possession_series & pullback_to_box & striker_primed
+    striker_primed_bull = (df['RSI'] >= 40) & (df['RSI'] <= 55)
+    df['Striker_Buy'] = in_possession_bull & pullback_to_box & striker_primed_bull
 
-    # 6. OANDA Defensive Math
+    in_possession_bear = df['Close'] < df['Midfield_200EMA']
+    rally_to_box = (df['High'] >= df['Tempo_20EMA']) & (df['Close'] <= df['Tempo_20EMA'] * 1.002)
+    striker_primed_bear = (df['RSI'] >= 45) & (df['RSI'] <= 60)
+    df['Striker_Sell'] = in_possession_bear & rally_to_box & striker_primed_bear
+
+    # 6. Sizing & Levels
     latest = df.iloc[-1]
     is_jpy = "JPY" in pair
     pip_scale = 0.01 if is_jpy else 0.0001
-    
-    # OANDA Margin requirement: 5% (20:1) for JPY pairs / metals, 2% (50:1) for standard majors
     margin_rate = 0.05 if (is_jpy or "GC=F" in pair) else 0.02
 
     stop_distance_price = latest['ATR_14'] * 1.5
     stop_pips = stop_distance_price / pip_scale
 
-    # Pip value calculation per standard lot
     pip_value_std_lot = (pip_scale / latest['Close']) * 100_000 if is_jpy else 10.0
-
-    # Risk-based lot sizing
     risk_dollars = account_nav * risk_pct
     lots_by_risk = risk_dollars / (stop_pips * pip_value_std_lot)
 
-    # Margin-capped lot sizing
     max_margin_dollars = account_nav * max_margin_pct
-    notional_per_lot = 100000.0
-    margin_per_lot = notional_per_lot * margin_rate
+    margin_per_lot = 100000.0 * margin_rate
     lots_by_margin = max_margin_dollars / margin_per_lot
 
-    # Bounded allowed lots
     allowed_standard_lots = min(lots_by_risk, lots_by_margin)
     required_margin = allowed_standard_lots * margin_per_lot
 
-    suggested_stop = latest['Close'] - stop_distance_price
-    take_profit = latest['Close'] + (stop_distance_price * 2.0)
-    
-    # Evaluated explicitly as a single boolean to prevent Series ambiguity
     in_possession = bool(latest['Close'] > latest['Midfield_200EMA'])
+    active_buy_signal = bool(latest['Striker_Buy'])
+    active_sell_signal = bool(latest['Striker_Sell'])
 
-    # 7. Top Metrics Bar
-    price_fmt = f"{latest['Close']:.3f}" if is_jpy else f"{latest['Close']:.5f}"
+    p_dec = 3 if is_jpy else 5
+    price_fmt = f"{latest['Close']:.{p_dec}f}"
+
+    # 7. Metrics Header
     st.title(f"Tactical Pitch: {selected_label} [{timeframe}]")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Live Market Price", price_fmt)
-    c2.metric(
-        "Possession Status", 
-        "ATTACKING" if in_possession else "DEFENDING", 
-        delta="Above 200 EMA" if in_possession else "-Below 200 EMA"
-    )
-    c3.metric(
-        "Defensive Stop Distance", 
-        f"{stop_pips:.1f} Pips", 
-        f"Target: +{stop_pips * 2:.1f} Pips (1:2)"
-    )
-    c4.metric(
-        "Strict Sizing (OANDA)", 
-        f"{allowed_standard_lots:.2f} Lots", 
-        f"Margin: ${required_margin:,.0f} ({int(1/margin_rate)}:1)"
-    )
+    c2.metric("Possession", "ATTACKING" if in_possession else "DEFENDING", delta="Above 200 EMA" if in_possession else "-Below 200 EMA")
+    c3.metric("Defensive Stop Distance", f"{stop_pips:.1f} Pips", f"Target: +{stop_pips * 2:.1f} Pips (1:2)")
+    c4.metric("Strict Sizing (OANDA)", f"{allowed_standard_lots:.2f} Lots", f"Margin: ${required_margin:,.0f} ({int(1/margin_rate)}:1)")
 
-    # 8. Interactive Plotly Pitch
-    fig = make_subplots(
-        rows=2, cols=1, 
-        shared_xaxes=True, 
-        vertical_spacing=0.05, 
-        row_heights=[0.75, 0.25]
-    )
+    # 8. ACTIVE SIGNAL DIRECTIVE BOX
+    st.write("---")
+    if active_buy_signal:
+        sl_price = latest['Close'] - stop_distance_price
+        tp_price = latest['Close'] + (stop_distance_price * 2.0)
+        st.success(f"""
+        ### 🟢 ACTIVE DIRECTIVE: BUY / LONG SIGNAL
+        * **Order Type:** Market Buy
+        * **Entry Price:** `{latest['Close']:.{p_dec}f}`
+        * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_pips:.1f} Pips)
+        * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (+{stop_pips * 2:.1f} Pips | 1:2 R:R)
+        * **Suggested Sizing:** `{allowed_standard_lots:.2f} Standard Lots` ({int(allowed_standard_lots * 100000):,} Units)
+        * **Tactical Confirmation:** Above 200 EMA + Pullback to 20 EMA touched + RSI primed ({latest['RSI']:.1f})
+        """)
+    elif active_sell_signal:
+        sl_price = latest['Close'] + stop_distance_price
+        tp_price = latest['Close'] - (stop_distance_price * 2.0)
+        st.error(f"""
+        ### 🔴 ACTIVE DIRECTIVE: SELL / SHORT SIGNAL
+        * **Order Type:** Market Sell
+        * **Entry Price:** `{latest['Close']:.{p_dec}f}`
+        * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_pips:.1f} Pips)
+        * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (-{stop_pips * 2:.1f} Pips | 1:2 R:R)
+        * **Suggested Sizing:** `{allowed_standard_lots:.2f} Standard Lots` ({int(allowed_standard_lots * 100000):,} Units)
+        * **Tactical Confirmation:** Below 200 EMA + Rally to 20 EMA touched + RSI primed ({latest['RSI']:.1f})
+        """)
+    else:
+        dist_to_ema20 = abs(latest['Close'] - latest['Tempo_20EMA']) / pip_scale
+        reason = (
+            f"Holding off. Waiting for value retest at 20 EMA (currently {dist_to_ema20:.1f} pips away at `{latest['Tempo_20EMA']:.{p_dec}f}`). Current RSI: `{latest['RSI']:.1f}`."
+        )
+        st.warning(f"""
+        ### 🟡 TACTICAL DIRECTIVE: STAND BY (PATIENT POSSESSION)
+        * **Status:** No trigger on active candle. Maintain position discipline.
+        * **Tactical Read:** {reason}
+        * **Prepared Defensive Size:** If trigger fires, max allowed size is **{allowed_standard_lots:.2f} Lots** ({stop_pips:.1f} pip stop).
+        """)
+
+    # 9. Interactive Chart
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
 
     fig.add_trace(go.Candlestick(
         x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
@@ -164,29 +175,38 @@ if df is not None and not df.empty:
     fig.add_trace(go.Scatter(x=df.index, y=df['Midfield_200EMA'], line=dict(color='#eab308', width=2), name="Midfield (200 EMA)"), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['Tempo_20EMA'], line=dict(color='#38bdf8', width=1.5, dash='dot'), name="Tempo (20 EMA)"), row=1, col=1)
 
-    # Striker Markers
-    striker_plays = df[df['Striker_Buy']]
-    marker_y = striker_plays['Low'] * (0.999 if is_jpy else 0.9998)
+    # Buy markers
+    buy_plays = df[df['Striker_Buy']]
     fig.add_trace(go.Scatter(
-        x=striker_plays.index, y=marker_y, mode='markers',
-        marker=dict(symbol='triangle-up', size=11, color='#22c55e'),
-        name="Striker Entry"
+        x=buy_plays.index, y=buy_plays['Low'] * (0.999 if is_jpy else 0.9998),
+        mode='markers', marker=dict(symbol='triangle-up', size=11, color='#22c55e'),
+        name="Buy Entry"
     ), row=1, col=1)
 
-    # RSI Pane
+    # Sell markers
+    sell_plays = df[df['Striker_Sell']]
+    fig.add_trace(go.Scatter(
+        x=sell_plays.index, y=sell_plays['High'] * (1.001 if is_jpy else 1.0002),
+        mode='markers', marker=dict(symbol='triangle-down', size=11, color='#ef4444'),
+        name="Sell Entry"
+    ), row=1, col=1)
+
+    # RSI
     fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='#c084fc', width=1.5), name="RSI Stamina"), row=2, col=1)
     fig.add_hline(y=70, line_dash="dash", line_color="#ef4444", row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="#22c55e", row=2, col=1)
 
+    # Layout configuration with state preservation
     fig.update_layout(
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
         height=680,
-        margin=dict(l=20, r=20, t=20, b=20)
+        margin=dict(l=20, r=20, t=20, b=20),
+        uirevision=pair  # Locks in trace isolations and user zoom across live data ticks
     )
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
 else:
     st.warning("Awaiting market data connection...")
 
