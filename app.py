@@ -123,24 +123,42 @@ sidebar_gemini_key = st.sidebar.text_input("Gemini API Key (Optional)", type="pa
 
 st.sidebar.caption(f"Sync Cycle: {refresh_cycle} | Feed: Active")
 
-# 5. Session Liquidity Filter (EST Timezone)
+# 5. Session Liquidity Filters (EST Timezone)
 est_tz = pytz.timezone("US/Eastern")
 now_est = datetime.now(est_tz)
-current_hour_est = now_est.hour + (now_est.minute / 60.0)
 
-def is_session_active(ticker_label):
+def evaluate_session_timing(ticker_label, dt):
     if "BTC" in ticker_label:
         return True, "Crypto 24/7"
+    
+    try:
+        if dt.tzinfo is None:
+            dt_est = pytz.timezone("UTC").localize(dt).astimezone(est_tz)
+        else:
+            dt_est = dt.astimezone(est_tz)
+    except Exception:
+        dt_est = dt
+        
+    hour_est = dt_est.hour + (dt_est.minute / 60.0)
+
+    # European pairs -> London Core (03:00 - 12:00 EST)
     if any(k in ticker_label for k in ["EUR", "GBP", "CHF"]) and "USD" not in ticker_label and "JPY" not in ticker_label:
-        active = (3.0 <= current_hour_est <= 12.0)
-        return active, "London Core (03:00 - 12:00 EST)"
+        return (3.0 <= hour_est <= 12.0), "London Core (03:00 - 12:00 EST)"
+    
+    # USD / CAD / Gold -> NY Core & London Overlap (08:00 - 16:30 EST or 03:00 - 11:30 EST)
     if any(k in ticker_label for k in ["USD", "CAD", "GC=F"]):
-        active = (8.0 <= current_hour_est <= 16.3) or (3.0 <= current_hour_est <= 11.5)
+        active = (8.0 <= hour_est <= 16.3) or (3.0 <= hour_est <= 11.5)
         return active, "NY / London Overlap (08:00 - 16:30 EST)"
+    
+    # Asian pairs -> Tokyo Active (19:00 - 04:00 EST or 03:00 - 11:30 EST)
     if any(k in ticker_label for k in ["JPY", "AUD", "NZD"]):
-        active = (current_hour_est >= 19.0 or current_hour_est <= 4.0) or (3.0 <= current_hour_est <= 11.5)
-        return active, "Tokyo / Asian Session"
+        active = (hour_est >= 19.0 or hour_est <= 4.0) or (3.0 <= hour_est <= 11.5)
+        return active, "Tokyo / Asian Active"
+        
     return True, "Open Liquidity"
+
+def is_session_active(ticker_label):
+    return evaluate_session_timing(ticker_label, now_est)
 
 # 6. Data Ingestion & Technical Calculations
 period_map = {"1m": "1d", "5m": "5d", "15m": "10d", "30m": "20d", "1h": "30d", "4h": "60d", "1d": "1y"}
@@ -165,16 +183,18 @@ def process_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # Signal setups
+    # Signal definitions with candlestick confirmation
     in_possession_bull = df['Close'] > df['Midfield_200EMA']
     pullback_to_box = (df['Low'] <= df['Tempo_20EMA']) & (df['Close'] >= df['Tempo_20EMA'] * 0.998)
     striker_primed_bull = (df['RSI'] >= 40) & (df['RSI'] <= 55)
-    df['Striker_Buy'] = in_possession_bull & pullback_to_box & striker_primed_bull
+    bull_candle_confirm = df['Close'] > df['Open']
+    df['Striker_Buy'] = in_possession_bull & pullback_to_box & striker_primed_bull & bull_candle_confirm
 
     in_possession_bear = df['Close'] < df['Midfield_200EMA']
     rally_to_box = (df['High'] >= df['Tempo_20EMA']) & (df['Close'] <= df['Tempo_20EMA'] * 1.002)
     striker_primed_bear = (df['RSI'] >= 45) & (df['RSI'] <= 60)
-    df['Striker_Sell'] = in_possession_bear & rally_to_box & striker_primed_bear
+    bear_candle_confirm = df['Close'] < df['Open']
+    df['Striker_Sell'] = in_possession_bear & rally_to_box & striker_primed_bear & bear_candle_confirm
 
     return df
 
@@ -355,7 +375,7 @@ if active_buy_signal and session_ok:
     * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (+{stop_metric * 2:.1f} {metric_label} | 1:2 R:R)
     * **Suggested Sizing:** `{sizing_label}`
-    * **Tactical Confirmation:** Above 200 EMA + Retest 20 EMA + RSI primed ({latest['RSI']:.1f})
+    * **Tactical Confirmation:** Above 200 EMA + Bullish bounce off 20 EMA + RSI primed ({latest['RSI']:.1f})
     """)
 elif active_sell_signal and session_ok:
     sl_price = latest['Close'] + stop_distance_price
@@ -367,14 +387,14 @@ elif active_sell_signal and session_ok:
     * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_metric:.1f} {metric_label})
     * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (-{stop_metric * 2:.1f} {metric_label} | 1:2 R:R)
     * **Suggested Sizing:** `{sizing_label}`
-    * **Tactical Confirmation:** Below 200 EMA + Rally 20 EMA + RSI primed ({latest['RSI']:.1f})
+    * **Tactical Confirmation:** Below 200 EMA + Bearish rejection off 20 EMA + RSI primed ({latest['RSI']:.1f})
     """)
 elif (active_buy_signal or active_sell_signal) and not session_ok:
     st.warning(f"""
     ### ⏸️ DIRECTIVE PAUSED: OFF-HOURS / LOW LIQUIDITY
-    * **Technical Setup Met:** Technical conditions fired on chart.
+    * **Technical Setup Met:** Technical entry conditions confirmed on chart.
     * **Session Guard:** Blocked because **{selected_label}** trades during **{session_name}**.
-    * **Reason:** Current time ({now_est.strftime('%H:%M EST')}) has minimal institutional volume. Spreads can widen and price will stall. Wait for active session open.
+    * **Reason:** Current time ({now_est.strftime('%H:%M EST')}) lacks institutional liquidity. Spreads can widen and price will stall. Wait for active session open.
     """)
 else:
     dist_to_ema20 = abs(latest['Close'] - latest['Tempo_20EMA']) / pip_scale
@@ -385,7 +405,7 @@ else:
     * **Session Status:** {session_name} ({'Active' if session_ok else 'Closed / Low Volume'}).
     """)
 
-# 10. AI Assistant Manager
+# 10. AI Assistant Manager (Persistent Debrief)
 st.write("---")
 if "ai_briefings" not in st.session_state:
     st.session_state.ai_briefings = {}
@@ -542,18 +562,80 @@ if not is_crypto:
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
 
 # =========================================================
-# 12. 📊 HISTORICAL MATCH LOG & WIN-RATE BACKTEST ENGINE
+# 12. 📊 QUANTITATIVE BACKTEST ENGINE (DISCIPLINED)
 # =========================================================
 st.write("---")
 st.subheader(f"Tactical Match Performance & Win Rate: {selected_label} [{timeframe}]")
 
-def calculate_historical_performance(df, is_crypto, is_jpy):
+def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy):
     trades = []
     pip_scale = 1.0 if is_crypto else (0.01 if is_jpy else 0.0001)
 
-    # Need at least 50 candles for indicators to stabilize
-    for i in range(50, len(df) - 1):
+    in_trade = False
+    active_trade = {}
+
+    for i in range(50, len(df)):
         row = df.iloc[i]
+
+        # 1. Manage Active Position (Single Active Position Rule)
+        if in_trade:
+            if active_trade['type'] == 'BUY':
+                if row['Low'] <= active_trade['sl']:
+                    trades.append({
+                        "Match Time": active_trade['time'],
+                        "Tactic": "BUY",
+                        "Entry": active_trade['entry'],
+                        "Stop Loss": active_trade['sl'],
+                        "Target (1:2)": active_trade['tp'],
+                        f"Risk ({metric_label})": active_trade['risk'],
+                        "Result": "LOSS",
+                        "R-Return": "-1.0 R"
+                    })
+                    in_trade = False
+                elif row['High'] >= active_trade['tp']:
+                    trades.append({
+                        "Match Time": active_trade['time'],
+                        "Tactic": "BUY",
+                        "Entry": active_trade['entry'],
+                        "Stop Loss": active_trade['sl'],
+                        "Target (1:2)": active_trade['tp'],
+                        f"Risk ({metric_label})": active_trade['risk'],
+                        "Result": "WIN",
+                        "R-Return": "+2.0 R"
+                    })
+                    in_trade = False
+            elif active_trade['type'] == 'SELL':
+                if row['High'] >= active_trade['sl']:
+                    trades.append({
+                        "Match Time": active_trade['time'],
+                        "Tactic": "SELL",
+                        "Entry": active_trade['entry'],
+                        "Stop Loss": active_trade['sl'],
+                        "Target (1:2)": active_trade['tp'],
+                        f"Risk ({metric_label})": active_trade['risk'],
+                        "Result": "LOSS",
+                        "R-Return": "-1.0 R"
+                    })
+                    in_trade = False
+                elif row['Low'] <= active_trade['tp']:
+                    trades.append({
+                        "Match Time": active_trade['time'],
+                        "Tactic": "SELL",
+                        "Entry": active_trade['entry'],
+                        "Stop Loss": active_trade['sl'],
+                        "Target (1:2)": active_trade['tp'],
+                        f"Risk ({metric_label})": active_trade['risk'],
+                        "Result": "WIN",
+                        "R-Return": "+2.0 R"
+                    })
+                    in_trade = False
+            continue
+
+        # 2. Check for Qualified Entry During Active Session
+        session_valid, _ = evaluate_session_timing(ticker_label, row.name)
+        if not session_valid:
+            continue
+
         is_buy = bool(row['Striker_Buy'])
         is_sell = bool(row['Striker_Sell'])
 
@@ -564,55 +646,37 @@ def calculate_historical_performance(df, is_crypto, is_jpy):
         raw_stop = (row['ATR_14'] * 1.5) / pip_scale
         stop_units = max(raw_stop, 8.0) if not is_crypto else (row['ATR_14'] * 1.5)
         stop_dist = stop_units * pip_scale
-        tp_dist = stop_dist * 2.0  # Strict 1:2 tactical target
+        tp_dist = stop_dist * 2.0
 
-        sl_price = entry_price - stop_dist if is_buy else entry_price + stop_dist
-        tp_price = entry_price + tp_dist if is_buy else entry_price - tp_dist
+        sl_price = (entry_price - stop_dist) if is_buy else (entry_price + stop_dist)
+        tp_price = (entry_price + tp_dist) if is_buy else (entry_price - tp_dist)
 
-        outcome = "OPEN"
-        exit_price = None
-        exit_time = None
+        in_trade = True
+        active_trade = {
+            "time": row.name.strftime('%Y-%m-%d %H:%M'),
+            "type": "BUY" if is_buy else "SELL",
+            "entry": round(entry_price, p_dec),
+            "sl": round(sl_price, p_dec),
+            "tp": round(tp_price, p_dec),
+            "risk": round(stop_units, 1)
+        }
 
-        # Walk forward through subsequent candles to test the system's call
-        for j in range(i + 1, len(df)):
-            future_bar = df.iloc[j]
-            if is_buy:
-                if future_bar['Low'] <= sl_price:
-                    outcome = "LOSS"
-                    exit_price = sl_price
-                    exit_time = future_bar.name
-                    break
-                elif future_bar['High'] >= tp_price:
-                    outcome = "WIN"
-                    exit_price = tp_price
-                    exit_time = future_bar.name
-                    break
-            elif is_sell:
-                if future_bar['High'] >= sl_price:
-                    outcome = "LOSS"
-                    exit_price = sl_price
-                    exit_time = future_bar.name
-                    break
-                elif future_bar['Low'] <= tp_price:
-                    outcome = "WIN"
-                    exit_price = tp_price
-                    exit_time = future_bar.name
-                    break
-
+    # If trade is still running on the latest candle
+    if in_trade:
         trades.append({
-            "Match Time": row.name.strftime('%Y-%m-%d %H:%M'),
-            "Tactic": "BUY" if is_buy else "SELL",
-            "Entry": round(entry_price, p_dec),
-            "Stop Loss": round(sl_price, p_dec),
-            "Target (1:2)": round(tp_price, p_dec),
-            f"Risk ({metric_label})": round(stop_units, 1),
-            "Result": outcome,
-            "R-Return": "+2.0 R" if outcome == "WIN" else ("-1.0 R" if outcome == "LOSS" else "Active")
+            "Match Time": active_trade['time'],
+            "Tactic": active_trade['type'],
+            "Entry": active_trade['entry'],
+            "Stop Loss": active_trade['sl'],
+            "Target (1:2)": active_trade['tp'],
+            f"Risk ({metric_label})": active_trade['risk'],
+            "Result": "OPEN",
+            "R-Return": "Active"
         })
 
     return pd.DataFrame(trades)
 
-perf_df = calculate_historical_performance(df, is_crypto, is_jpy)
+perf_df = calculate_historical_performance(df, selected_label, is_crypto, is_jpy)
 
 if not perf_df.empty:
     completed = perf_df[perf_df['Result'].isin(['WIN', 'LOSS'])]
@@ -622,9 +686,8 @@ if not perf_df.empty:
     win_rate = (wins / total_completed * 100) if total_completed > 0 else 0.0
     net_r = (wins * 2.0) - (losses * 1.0)
 
-    # Historical Performance Quad-Cards
     b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Historical Setups", f"{len(perf_df)} Calls", f"{total_completed} Completed")
+    b1.metric("Disciplined Calls", f"{len(perf_df)} Plays", f"{total_completed} Completed")
     b2.metric("Tactical Win Rate", f"{win_rate:.1f}%", f"{wins}W - {losses}L")
     b3.metric("Net Expectancy", f"{net_r:+.1f} R", delta="Net Positive" if net_r > 0 else "-Drawdown")
     b4.metric("Risk-to-Reward Profile", "1 : 2.0", "Asymmetric Target")
@@ -632,5 +695,4 @@ if not perf_df.empty:
     with st.expander(f"Detailed Match Call Log ({len(perf_df)} Total Plays)", expanded=False):
         st.dataframe(perf_df.iloc[::-1], use_container_width=True, hide_index=True)
 else:
-    st.info("No completed tactical calls found in the current candle sample window. Switch timeframes to inspect longer horizons.")
-
+    st.info("No tactical setups triggered during active liquidity windows in this historical sample.")
