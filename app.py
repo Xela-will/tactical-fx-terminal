@@ -10,11 +10,11 @@ import pytz
 import os
 
 # =========================================================
-# 1. Page Configuration & Theme
+# 1. Page Configuration & Custom Tactical Theme
 # =========================================================
 st.set_page_config(page_title="Tactical War Room | FX MTF Terminal", layout="wide")
 
-refresh_cycle = st_autorefresh(interval=20000, limit=2000, key="fx_stream_sync")
+refresh_cycle = st_autorefresh(interval=25000, limit=2000, key="fx_stream_sync")
 
 st.markdown("""
 <style>
@@ -56,25 +56,21 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================================================
-# 2. Watchlist Roster & Timeframe Map
+# 2. Watchlist & MTF Matrix Configuration
 # =========================================================
-FOREX_ROSTER = {
-    "USD/JPY": "USDJPY=X",
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
+WATCHLIST = {
     "Gold (GC=F)": "GC=F",
-    "Bitcoin (BTC/USD)": "BTC-USD",
-    "USD/CAD": "USDCAD=X",
-    "AUD/USD": "AUDUSD=X",
-    "USD/CHF": "USDCHF=X",
-    "NZD/USD": "NZDUSD=X",
+    "USD/JPY": "USDJPY=X",
     "GBP/JPY": "GBPJPY=X",
     "EUR/JPY": "EURJPY=X",
-    "EUR/GBP": "EURGBP=X"
+    "Bitcoin (BTC/USD)": "BTC-USD",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "AUD/USD": "AUDUSD=X"
 }
 
 MTF_CONFIG = {
-    "1m":  {"htf": "5m",  "ltf_period": "2d",  "htf_period": "5d"},
     "5m":  {"htf": "15m", "ltf_period": "5d",  "htf_period": "10d"},
     "15m": {"htf": "1h",  "ltf_period": "10d", "htf_period": "30d"},
     "30m": {"htf": "4h",  "ltf_period": "20d", "htf_period": "60d"},
@@ -84,18 +80,20 @@ MTF_CONFIG = {
 }
 
 st.sidebar.title("Tactical Room")
-timeframe = st.sidebar.selectbox("Match Timeframe (LTF)", list(MTF_CONFIG.keys()), index=4)
+
+timeframe = st.sidebar.selectbox("Match Timeframe (LTF)", list(MTF_CONFIG.keys()), index=1)
 htf_tf = MTF_CONFIG[timeframe]["htf"]
 
-use_htf = st.sidebar.checkbox(f"Enforce {htf_tf.upper()} Trend Alignment", value=True)
-target_rr = st.sidebar.selectbox("Tactical Risk:Reward Profile", [1.5, 2.0, 2.5, 3.0], index=1)
+use_htf = st.sidebar.checkbox(f"Enforce {htf_tf.upper()} Trend Anchor", value=True)
+target_rr = st.sidebar.select_slider("Target R:R Profile", options=[1.0, 1.2, 1.5, 2.0, 2.5, 3.0], value=2.0)
 trade_management = st.sidebar.selectbox("Position Management", ["No Breakeven (Pure Target/Stop)", "Move to BE at +1.0R"], index=0)
+stop_model = st.sidebar.selectbox("Defensive Stop Model", ["Structural (Recent Swing Low/High)", "Volatility (1.5x ATR)"], index=0)
 
-adx_min = st.sidebar.slider("Chop Filter: Min ADX Velocity", min_value=15, max_value=32, value=20, step=1)
-pullback_atr_depth = st.sidebar.slider("Pullback Tolerance (x ATR)", 0.2, 1.0, 0.5, 0.05)
+adx_min = st.sidebar.slider("Chop Gate: Min ADX Velocity", min_value=15, max_value=30, value=20, step=1)
+pullback_atr_depth = st.sidebar.slider("Pullback Tolerance (x ATR)", 0.2, 0.8, 0.45, 0.05)
 
 st.sidebar.write("---")
-st.sidebar.subheader("Account & Risk")
+st.sidebar.subheader("Capital & Sizing")
 account_nav = st.sidebar.number_input("Account NAV ($)", value=500.0, step=50.0)
 risk_pct = st.sidebar.slider("Cash Risk per Trade (%)", min_value=0.5, max_value=3.0, value=1.5, step=0.5) / 100.0
 max_margin_pct = st.sidebar.slider("Max Margin Cap (%)", min_value=10, max_value=50, value=30, step=5) / 100.0
@@ -107,76 +105,96 @@ est_tz = pytz.timezone("US/Eastern")
 now_est = datetime.now(est_tz)
 
 def evaluate_session_timing(ticker_label, dt, tf_label):
-    if tf_label in ["1h", "4h", "1d"]:
-        return True, "Open Liquidity"
     if "BTC" in ticker_label:
         return True, "Crypto 24/7"
+    if tf_label in ["4h", "1d"]:
+        return True, "Macro Session"
+    
     try:
         dt_est = dt.tz_convert(est_tz) if dt.tzinfo else pytz.timezone("UTC").localize(dt).astimezone(est_tz)
     except Exception:
         dt_est = dt
         
     hour_est = dt_est.hour + (dt_est.minute / 60.0)
-    if any(k in ticker_label for k in ["JPY", "AUD", "NZD"]):
+
+    if any(k in ticker_label for k in ["JPY", "AUD"]):
         active = (hour_est >= 19.0 or hour_est <= 4.5) or (3.0 <= hour_est <= 11.5) or (8.0 <= hour_est <= 16.3)
-        return active, "Tokyo / Core Active"
-    if any(k in ticker_label for k in ["EUR", "GBP", "CHF"]) and "USD" not in ticker_label:
+        return active, "Tokyo / Core"
+    if any(k in ticker_label for k in ["EUR", "GBP"]) and "USD" not in ticker_label:
         return (3.0 <= hour_est <= 12.0), "London Core"
     if any(k in ticker_label for k in ["USD", "CAD", "GC=F"]):
         active = (8.0 <= hour_est <= 16.3) or (3.0 <= hour_est <= 11.5)
-        return active, "NY / London Overlap"
+        return active, "NY / London"
     return True, "Open Liquidity"
 
 def is_session_active(ticker_label):
     return evaluate_session_timing(ticker_label, now_est, timeframe)
 
 # =========================================================
-# 4. Indicators & Safe Multi-Timeframe Alignment
+# 4. Resilient Data Pipeline & Quantitative Indicators
 # =========================================================
 @st.cache_data(ttl=25)
-def fetch_raw_data(symbols, interval, period):
-    return yf.download(symbols, period=period, interval=interval, group_by='ticker', progress=False)
-
-def clean_timezones(df):
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC')
-    else:
-        df.index = df.index.tz_convert('UTC')
-    return df.sort_index()
-
-def process_mtf_indicators(df_ltf, df_htf, enforce_htf):
-    if df_ltf is None or len(df_ltf) < 55 or df_htf is None or len(df_htf) < 50:
+def download_clean_ticker(symbol, interval, period):
+    try:
+        df = yf.download(symbol, period=period, interval=interval, progress=False)
+        if df is None or df.empty:
+            return None
+        
+        # Flatten MultiIndex if yfinance wrapped single ticker
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        df = df.dropna(subset=['Close'])
+        if len(df) < 30:
+            return None
+            
+        df.index = pd.to_datetime(df.index, utc=True)
+        df = df[~df.index.duplicated(keep='first')].sort_index()
+        return df
+    except Exception:
         return None
 
-    df_ltf = clean_timezones(df_ltf.copy())
-    df_htf = clean_timezones(df_htf.copy())
+def process_mtf_indicators(df_ltf, df_htf, enforce_htf):
+    if df_ltf is None or len(df_ltf) < 55:
+        return None
 
-    # HTF Calculations
-    df_htf['HTF_50EMA'] = df_htf['Close'].ewm(span=50, adjust=False).mean()
-    df_htf['HTF_Bull'] = (df_htf['Close'] > df_htf['HTF_50EMA']).astype(int)
-    df_htf['HTF_Bear'] = (df_htf['Close'] < df_htf['HTF_50EMA']).astype(int)
+    df_ltf = df_ltf.copy()
 
-    # Shift by 1 bar to prevent forward-looking bias
-    htf_shifted = df_htf[['HTF_50EMA', 'HTF_Bull', 'HTF_Bear']].shift(1)
+    # HTF 50 EMA Alignment
+    if df_htf is not None and len(df_htf) >= 30:
+        df_htf = df_htf.copy()
+        df_htf['HTF_50EMA'] = df_htf['Close'].ewm(span=50, adjust=False).mean()
+        df_htf['HTF_Bull'] = (df_htf['Close'] > df_htf['HTF_50EMA']).astype(int)
+        df_htf['HTF_Bear'] = (df_htf['Close'] < df_htf['HTF_50EMA']).astype(int)
 
-    # Merge backward onto LTF
-    df = pd.merge_asof(
-        df_ltf,
-        htf_shifted,
-        left_index=True,
-        right_index=True,
-        direction='backward'
-    )
+        htf_shifted = df_htf[['HTF_50EMA', 'HTF_Bull', 'HTF_Bear']].shift(1)
 
-    # Convert back to strict boolean without NaNs
-    df['HTF_Bull'] = df['HTF_Bull'].fillna(0).astype(bool)
-    df['HTF_Bear'] = df['HTF_Bear'].fillna(0).astype(bool)
+        try:
+            df = pd.merge_asof(
+                df_ltf,
+                htf_shifted,
+                left_index=True,
+                right_index=True,
+                direction='backward'
+            )
+            df['HTF_Bull'] = df['HTF_Bull'].fillna(0).astype(bool)
+            df['HTF_Bear'] = df['HTF_Bear'].fillna(0).astype(bool)
+        except Exception:
+            df = df_ltf
+            df['HTF_Bull'] = True
+            df['HTF_Bear'] = True
+            df['HTF_50EMA'] = np.nan
+    else:
+        df = df_ltf
+        df['HTF_Bull'] = True
+        df['HTF_Bear'] = True
+        df['HTF_50EMA'] = np.nan
 
-    # LTF Calculations
+    # LTF Indicators
     df['Midfield_200EMA'] = df['Close'].ewm(span=200, adjust=False).mean()
     df['Tempo_20EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
 
-    # Wilder's ATR(14)
+    # Wilder's True Range & ATR(14)
     hl = df['High'] - df['Low']
     hc = (df['High'] - df['Close'].shift(1)).abs()
     lc = (df['Low'] - df['Close'].shift(1)).abs()
@@ -202,12 +220,12 @@ def process_mtf_indicators(df_ltf, df_htf, enforce_htf):
     rs = gain / loss.replace(0, np.nan)
     df['RSI'] = (100 - (100 / (1 + rs))).fillna(50)
 
-    # 200 EMA Angle Slope
+    # Trend Angle Slope
     slope_diff = df['Midfield_200EMA'] - df['Midfield_200EMA'].shift(5)
     df['EMA200_Slope_Bull'] = slope_diff > (df['ATR_14'] * 0.02)
     df['EMA200_Slope_Bear'] = slope_diff < -(df['ATR_14'] * 0.02)
 
-    # Pullback and Candlestick Confirmation
+    # Pullback Buffer & Candlestick Confirmation
     box_buffer = df['ATR_14'] * pullback_atr_depth
     bull_pullback = (df['Low'] <= df['Tempo_20EMA'] + box_buffer) & (df['Close'] >= df['Tempo_20EMA'] - box_buffer)
     bear_rally = (df['High'] >= df['Tempo_20EMA'] - box_buffer) & (df['Close'] <= df['Tempo_20EMA'] + box_buffer)
@@ -216,10 +234,9 @@ def process_mtf_indicators(df_ltf, df_htf, enforce_htf):
     lower_wick = df[['Open', 'Close']].min(axis=1) - df['Low']
     upper_wick = df['High'] - df[['Open', 'Close']].max(axis=1)
 
-    bull_confirmed = (lower_wick >= body_size * 0.4) | (df['Close'] > df['Open'])
-    bear_confirmed = (upper_wick >= body_size * 0.4) | (df['Close'] < df['Open'])
+    bull_rejection = (lower_wick >= body_size * 0.35) | (df['Close'] > df['Open'])
+    bear_rejection = (upper_wick >= body_size * 0.35) | (df['Close'] < df['Open'])
 
-    # Signal Gate
     has_velocity = df['ADX'] >= adx_min
     bull_structure = (df['Close'] > df['Midfield_200EMA']) & df['EMA200_Slope_Bull'] & has_velocity
     bear_structure = (df['Close'] < df['Midfield_200EMA']) & df['EMA200_Slope_Bear'] & has_velocity
@@ -227,61 +244,42 @@ def process_mtf_indicators(df_ltf, df_htf, enforce_htf):
     htf_long_ok = df['HTF_Bull'] if enforce_htf else True
     htf_short_ok = df['HTF_Bear'] if enforce_htf else True
 
-    df['Striker_Buy'] = bull_structure & bull_pullback & bull_confirmed & (df['RSI'] >= 40) & (df['RSI'] <= 65) & htf_long_ok
-    df['Striker_Sell'] = bear_structure & bear_rally & bear_confirmed & (df['RSI'] >= 35) & (df['RSI'] <= 60) & htf_short_ok
+    df['Striker_Buy'] = bull_structure & bull_pullback & bull_rejection & (df['RSI'] >= 40) & (df['RSI'] <= 65) & htf_long_ok
+    df['Striker_Sell'] = bear_structure & bear_rally & bear_rejection & (df['RSI'] >= 35) & (df['RSI'] <= 60) & htf_short_ok
 
     return df
 
-def scan_all_mtf(roster, ltf_tf, cfg, enforce_htf):
-    ticker_symbols = list(roster.values())
-    raw_ltf = fetch_raw_data(ticker_symbols, interval=ltf_tf, period=cfg["ltf_period"])
-    raw_htf = fetch_raw_data(ticker_symbols, interval=cfg["htf"], period=cfg["htf_period"])
-
+@st.cache_data(ttl=25)
+def scan_all_markets(roster, ltf_tf, cfg, enforce_htf):
     results = {}
     for label, sym in roster.items():
-        try:
-            # Handle SingleIndex and MultiIndex cleanly
-            if isinstance(raw_ltf.columns, pd.MultiIndex):
-                if sym not in raw_ltf.columns.levels[0]: continue
-                df_p_ltf = raw_ltf[sym].dropna(subset=['Close'])
-            else:
-                df_p_ltf = raw_ltf.dropna(subset=['Close'])
-
-            if isinstance(raw_htf.columns, pd.MultiIndex):
-                if sym not in raw_htf.columns.levels[0]: continue
-                df_p_htf = raw_htf[sym].dropna(subset=['Close'])
-            else:
-                df_p_htf = raw_htf.dropna(subset=['Close'])
-
-            processed = process_mtf_indicators(df_p_ltf, df_p_htf, enforce_htf)
+        df_ltf = download_clean_ticker(sym, ltf_tf, cfg["ltf_period"])
+        df_htf = download_clean_ticker(sym, cfg["htf"], cfg["htf_period"])
+        
+        if df_ltf is not None and not df_ltf.empty:
+            processed = process_mtf_indicators(df_ltf, df_htf, enforce_htf)
             if processed is not None and not processed.empty:
                 results[label] = processed
-        except Exception:
-            continue
     return results
 
-market_data = scan_all_mtf(FOREX_ROSTER, timeframe, MTF_CONFIG[timeframe], use_htf)
+market_data = scan_all_markets(WATCHLIST, timeframe, MTF_CONFIG[timeframe], use_htf)
 
-# =========================================================
-# 5. Defensive App Failure Guard (Prevents IndexError)
-# =========================================================
 if not market_data:
-    st.error(f"⚠️ Market data stream returned empty for `{timeframe}` with `{htf_tf}` macro alignment. Yahoo Finance might be rate-limiting or data was unavailable.")
-    st.info("Try selecting a different timeframe (e.g., 15m or 30m) or uncheck 'Enforce Macro Alignment'.")
+    st.error(f"⚠️ Market data returned empty for `{timeframe}`. Try switching timeframes.")
     st.stop()
 
 # =========================================================
-# 6. Tactical Radar Scanner
+# 5. Tactical Radar Scanner
 # =========================================================
 st.title("Tactical Radar: All-Pitch Scanner")
-st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} | Frame: `{timeframe}` | Anchor: `{htf_tf.upper()}` 50 EMA")
+st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} | Frame: `{timeframe}` | Macro Anchor: `{htf_tf.upper()}` 50 EMA")
 
 radar_records = []
 active_buys, active_sells = [], []
 
 for label, df_item in market_data.items():
     latest = df_item.iloc[-1]
-    sym = FOREX_ROSTER[label]
+    sym = WATCHLIST[label]
     is_jpy = "JPY" in sym
     is_crypto = "BTC" in sym
     session_ok, _ = is_session_active(label)
@@ -329,7 +327,7 @@ with st.expander("Tactical Matchday Board (Quick Scanner)", expanded=True):
 st.write("---")
 
 # =========================================================
-# 7. Detailed Pitch Inspector
+# 6. Detailed Pitch Inspector
 # =========================================================
 pitch_options = list(market_data.keys())
 if "selected_pitch_key" not in st.session_state or st.session_state.selected_pitch_key not in pitch_options:
@@ -338,33 +336,44 @@ if "selected_pitch_key" not in st.session_state or st.session_state.selected_pit
 selected_label = st.selectbox("Select Pitch to Inspect in Detail:", pitch_options, key="selected_pitch_key")
 
 df = market_data[selected_label]
-pair = FOREX_ROSTER[selected_label]
+pair = WATCHLIST[selected_label]
 latest = df.iloc[-1]
 session_ok, session_name = is_session_active(selected_label)
 
 is_jpy = "JPY" in pair
 is_crypto = "BTC" in pair
 is_gold = "GC=F" in pair
+p_dec = 1 if is_crypto else (3 if is_jpy else 5)
+pip_scale = 1.0 if is_crypto else (0.01 if is_jpy else 0.0001)
 
+# Defensive Stop Computation (Structural vs ATR)
+if "Structural" in stop_model and len(df) >= 6:
+    swing_low = df['Low'].iloc[-6:-1].min()
+    swing_high = df['High'].iloc[-6:-1].max()
+    buffer_amt = latest['ATR_14'] * 0.3
+    
+    # Calculate for Long
+    raw_dist_long = (latest['Close'] - (swing_low - buffer_amt))
+    # Calculate for Short
+    raw_dist_short = ((swing_high + buffer_amt) - latest['Close'])
+    
+    # Base stop distance on active possession
+    stop_distance_price = max(raw_dist_long if latest['Close'] > latest['Midfield_200EMA'] else raw_dist_short, 8.0 * pip_scale)
+else:
+    stop_distance_price = max(latest['ATR_14'] * 1.5, 8.0 * pip_scale if not is_crypto else latest['ATR_14'] * 1.5)
+
+stop_metric = stop_distance_price / pip_scale
+metric_label = "USD ($)" if is_crypto else "Pips"
+
+# Position Sizing
 if is_crypto:
-    pip_scale = 1.0
     margin_rate = 0.50
-    stop_distance_price = latest['ATR_14'] * 1.5
-    stop_metric = stop_distance_price
-    metric_label = "USD ($)"
     risk_dollars = account_nav * risk_pct
     allowed_units = risk_dollars / stop_distance_price
     required_margin = allowed_units * latest['Close'] * margin_rate
     sizing_label = f"{allowed_units:.3f} BTC"
 else:
-    pip_scale = 0.01 if is_jpy else 0.0001
     margin_rate = 0.05 if (is_jpy or is_gold) else 0.02
-    metric_label = "Pips"
-
-    raw_pips = (latest['ATR_14'] * 1.5) / pip_scale
-    stop_metric = max(raw_pips, 8.0)
-    stop_distance_price = stop_metric * pip_scale
-
     pip_value_std_lot = (pip_scale / latest['Close']) * 100_000 if is_jpy else 10.0
     risk_dollars = account_nav * risk_pct
     lots_by_risk = risk_dollars / (stop_metric * pip_value_std_lot)
@@ -378,7 +387,6 @@ else:
     units_count = allowed_standard_lots * 100_000
     sizing_label = f"{units_count:,.0f} Units ({allowed_standard_lots:.3f} Lots)" if allowed_standard_lots < 0.1 else f"{allowed_standard_lots:.2f} Std Lots"
 
-p_dec = 1 if is_crypto else (3 if is_jpy else 5)
 price_fmt = f"{latest['Close']:.{p_dec}f}"
 in_possession = bool(latest['Close'] > latest['Midfield_200EMA'])
 htf_is_bull = bool(latest.get('HTF_Bull', False))
@@ -410,6 +418,46 @@ c3.metric(f"Defensive Stop", f"{stop_metric:.1f} {metric_label}", f"Target: +{st
 c4.metric(f"Strict Size ({risk_pct*100:.1f}% Risk)", sizing_label, f"Req Margin: ${required_margin:,.2f}")
 
 # =========================================================
+# 7. Restored Active Directive Box (Buy/Sell, Entry, SL, TP)
+# =========================================================
+active_buy = bool(latest['Striker_Buy'])
+active_sell = bool(latest['Striker_Sell'])
+tp_mult = float(target_rr)
+
+if active_buy and session_ok:
+    sl_price = latest['Close'] - stop_distance_price
+    tp_price = latest['Close'] + (stop_distance_price * tp_mult)
+    st.success(f"""
+    ### 🟢 ACTIVE DIRECTIVE: BUY / LONG SIGNAL
+    * **Action:** Market Buy
+    * **Entry Price:** `{latest['Close']:.{p_dec}f}`
+    * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (-{stop_metric:.1f} {metric_label})
+    * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (+{stop_metric * tp_mult:.1f} {metric_label} | 1:{tp_mult} R:R Profile)
+    * **Execution Quality:** Macro `{htf_tf.upper()}` 50 EMA aligned + ADX `{latest['ADX']:.1f}` velocity confirmed.
+    * **Management Rule:** { 'Hands off — Target or Stop only.' if 'No Breakeven' in trade_management else f'Lock SL to breakeven once price reaches +{stop_metric:.1f} {metric_label}.' }
+    """)
+elif active_sell and session_ok:
+    sl_price = latest['Close'] + stop_distance_price
+    tp_price = latest['Close'] - (stop_distance_price * tp_mult)
+    st.error(f"""
+    ### 🔴 ACTIVE DIRECTIVE: SELL / SHORT SIGNAL
+    * **Action:** Market Sell
+    * **Entry Price:** `{latest['Close']:.{p_dec}f}`
+    * **Stop Loss (SL):** `{sl_price:.{p_dec}f}` (+{stop_metric:.1f} {metric_label})
+    * **Take Profit (TP):** `{tp_price:.{p_dec}f}` (-{stop_metric * tp_mult:.1f} {metric_label} | 1:{tp_mult} R:R Profile)
+    * **Execution Quality:** Macro `{htf_tf.upper()}` 50 EMA aligned + ADX `{latest['ADX']:.1f}` velocity confirmed.
+    * **Management Rule:** { 'Hands off — Target or Stop only.' if 'No Breakeven' in trade_management else f'Lock SL to breakeven once price reaches -{stop_metric:.1f} {metric_label}.' }
+    """)
+else:
+    status_reason = f"Macro {htf_tf.upper()} is {'Bullish' if htf_is_bull else 'Bearish'}. Waiting for pullbacks to the 20 EMA." if use_htf else "Scanning for structure touch."
+    st.info(f"""
+    ### 🟡 TACTICAL DIRECTIVE: STAND BY (PATIENT POSSESSION)
+    * **Status:** No qualified setup on `{timeframe}` pitch. ADX: `{latest['ADX']:.1f}` (Requires $\ge$ {adx_min}).
+    * **Market Session:** {session_name} ({'Active' if session_ok else 'Low Volume'}).
+    * **Alignment:** {status_reason}
+    """)
+
+# =========================================================
 # 8. Interactive Pitch Chart
 # =========================================================
 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.75, 0.25])
@@ -426,7 +474,7 @@ fig.add_trace(go.Scatter(
     x=df.index, y=df['Tempo_20EMA'], line=dict(color='#38bdf8', width=1.5, dash='dot'), name="LTF 20 EMA"
 ), row=1, col=1)
 
-if 'HTF_50EMA' in df.columns:
+if 'HTF_50EMA' in df.columns and not df['HTF_50EMA'].isna().all():
     fig.add_trace(go.Scatter(
         x=df.index, y=df['HTF_50EMA'], line=dict(color='#a855f7', width=2, dash='dash'), name=f"Macro {htf_tf.upper()} 50 EMA"
     ), row=1, col=1)
@@ -462,12 +510,12 @@ if not is_crypto:
 st.plotly_chart(fig, use_container_width=True, key=f"pitch_{pair}")
 
 # =========================================================
-# 9. Realistic Backtester Engine (Modular Exit Model)
+# 9. Realistic Backtester Engine
 # =========================================================
 st.write("---")
 st.subheader(f"Tactical Match Performance & Expectancy: {selected_label} [{timeframe} + {htf_tf.upper()}]")
 
-def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_target, management_mode):
+def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_target, management_mode, stop_type):
     trades = []
     pip_scale = 1.0 if is_crypto else (0.01 if is_jpy else 0.0001)
 
@@ -538,12 +586,27 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_tar
             continue
 
         entry_price = row['Close']
-        raw_stop = (row['ATR_14'] * 1.5) / pip_scale
-        stop_units = max(raw_stop, 8.0) if not is_crypto else (row['ATR_14'] * 1.5)
-        stop_dist = stop_units * pip_scale
-        tp_dist = stop_dist * rr_target
 
-        sl_price = (entry_price - stop_dist) if is_buy else (entry_price + stop_dist)
+        # Determine Stop Distance
+        if "Structural" in stop_type and i >= 6:
+            swing_low = df['Low'].iloc[i-5:i].min()
+            swing_high = df['High'].iloc[i-5:i].max()
+            buffer_amt = row['ATR_14'] * 0.3
+            if is_buy:
+                sl_price = swing_low - buffer_amt
+                stop_dist = max(entry_price - sl_price, 8.0 * pip_scale)
+                sl_price = entry_price - stop_dist
+            else:
+                sl_price = swing_high + buffer_amt
+                stop_dist = max(sl_price - entry_price, 8.0 * pip_scale)
+                sl_price = entry_price + stop_dist
+        else:
+            raw_stop = (row['ATR_14'] * 1.5) / pip_scale
+            stop_units = max(raw_stop, 8.0) if not is_crypto else (row['ATR_14'] * 1.5)
+            stop_dist = stop_units * pip_scale
+            sl_price = (entry_price - stop_dist) if is_buy else (entry_price + stop_dist)
+
+        tp_dist = stop_dist * rr_target
         tp_price = (entry_price + tp_dist) if is_buy else (entry_price - tp_dist)
         be_trigger_price = (entry_price + stop_dist) if is_buy else (entry_price - stop_dist)
 
@@ -556,12 +619,12 @@ def calculate_historical_performance(df, ticker_label, is_crypto, is_jpy, rr_tar
             "tp": round(tp_price, p_dec),
             "be_threshold": round(be_trigger_price, p_dec),
             "be_triggered": False,
-            "risk": round(stop_units, 1)
+            "risk": round(stop_dist / pip_scale, 1)
         }
 
     return pd.DataFrame(trades)
 
-perf_df = calculate_historical_performance(df, selected_label, is_crypto, is_jpy, target_rr, trade_management)
+perf_df = calculate_historical_performance(df, selected_label, is_crypto, is_jpy, target_rr, trade_management, stop_model)
 
 if not perf_df.empty:
     completed = perf_df[perf_df['Result'].isin(['WIN', 'LOSS', 'SCRATCH'])]
@@ -577,7 +640,7 @@ if not perf_df.empty:
     b1.metric("Disciplined Plays", f"{len(perf_df)} Total", f"{len(completed)} Closed")
     b2.metric("Decisive Win Rate", f"{win_rate:.1f}%", f"{wins}W - {scratches}BE - {losses}L")
     b3.metric("Net Tactical Expectancy", f"{net_r:+.1f} R", delta="Net Positive" if net_r > 0 else "-Drawdown")
-    b4.metric("Exit Model", trade_management.split()[0], f"Target 1:{target_rr:.1f}")
+    b4.metric("Management Mode", trade_management.split()[0], f"Target 1:{target_rr:.1f}")
 
     with st.expander(f"Detailed Match Call Log ({len(perf_df)} Total Plays)", expanded=False):
         st.dataframe(perf_df.drop(columns=['r_numeric']).iloc[::-1], use_container_width=True, hide_index=True)
