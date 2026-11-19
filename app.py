@@ -7,8 +7,16 @@ from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 import pytz
-import requests
 import os
+import requests
+
+# =========================================================
+# 1. Page Configuration & Custom Tactical Theme
+# =========================================================
+st.set_page_config(page_title="Tactical War Room | FX MTF Terminal", layout="wide")
+
+# 60-second refresh cycle to protect Yahoo Finance rate limits
+refresh_cycle = st_autorefresh(interval=60000, limit=2000, key="fx_stream_sync")
 
 def send_telegram_alert(message):
     bot_token = "9147061627:AAHW0mNPH13a-MNBquysnPceFR7WMKv1Pfw"
@@ -19,13 +27,6 @@ def send_telegram_alert(message):
         requests.post(url, json=payload, timeout=5)
     except Exception:
         pass
-
-# =========================================================
-# 1. Page Configuration & Custom Tactical Theme
-# =========================================================
-st.set_page_config(page_title="Tactical War Room | FX MTF Terminal", layout="wide")
-
-refresh_cycle = st_autorefresh(interval=25000, limit=2000, key="fx_stream_sync")
 
 st.markdown("""
 <style>
@@ -144,14 +145,13 @@ def is_session_active(ticker_label):
 # =========================================================
 # 4. Resilient Data Pipeline & Quantitative Indicators
 # =========================================================
-@st.cache_data(ttl=25)
+@st.cache_data(ttl=30)
 def download_clean_ticker(symbol, interval, period):
     try:
         df = yf.download(symbol, period=period, interval=interval, progress=False)
         if df is None or df.empty:
             return None
         
-        # Flatten MultiIndex if yfinance wrapped single ticker
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
@@ -178,16 +178,6 @@ def process_mtf_indicators(df_ltf, df_htf, enforce_htf):
         df_htf['HTF_Bull'] = (df_htf['Close'] > df_htf['HTF_50EMA']).astype(int)
         df_htf['HTF_Bear'] = (df_htf['Close'] < df_htf['HTF_50EMA']).astype(int)
 
-if active_buys or active_sells:
-    alerts = []
-    if active_buys: 
-        alerts.append(f"🟢 **LIVE MTF BUY:** {', '.join(active_buys)}")
-        send_telegram_alert(f"🟢 *TACTICAL MTF BUY ALERT*\nInstruments: {', '.join(active_buys)}\nTimeframe: {timeframe} | Macro: {htf_tf.upper()}")
-    if active_sells: 
-        alerts.append(f"🔴 **LIVE MTF SELL:** {', '.join(active_sells)}")
-        send_telegram_alert(f"🔴 *TACTICAL MTF SELL ALERT*\nInstruments: {', '.join(active_sells)}\nTimeframe: {timeframe} | Macro: {htf_tf.upper()}")
-    st.success(" | ".join(alerts))
-        
         htf_shifted = df_htf[['HTF_50EMA', 'HTF_Bull', 'HTF_Bear']].shift(1)
 
         try:
@@ -270,7 +260,7 @@ if active_buys or active_sells:
 
     return df
 
-@st.cache_data(ttl=25)
+@st.cache_data(ttl=30)
 def scan_all_markets(roster, ltf_tf, cfg, enforce_htf):
     results = {}
     for label, sym in roster.items():
@@ -290,7 +280,7 @@ if not market_data:
     st.stop()
 
 # =========================================================
-# 5. Tactical Radar Scanner
+# 5. Tactical Radar Scanner & Push Alerts
 # =========================================================
 st.title("Tactical Radar: All-Pitch Scanner")
 st.caption(f"Pitch Clock: {now_est.strftime('%H:%M:%S EST')} | Frame: `{timeframe}` | Macro Anchor: `{htf_tf.upper()}` 50 EMA")
@@ -332,8 +322,12 @@ for label, df_item in market_data.items():
 
 if active_buys or active_sells:
     alerts = []
-    if active_buys: alerts.append(f"🟢 **LIVE MTF BUY:** {', '.join(active_buys)}")
-    if active_sells: alerts.append(f"🔴 **LIVE MTF SELL:** {', '.join(active_sells)}")
+    if active_buys: 
+        alerts.append(f"🟢 **LIVE MTF BUY:** {', '.join(active_buys)}")
+        send_telegram_alert(f"⚽ *TACTICAL MTF BUY ALERT*\nInstruments: {', '.join(active_buys)}\nTimeframe: {timeframe} | Macro: {htf_tf.upper()}")
+    if active_sells: 
+        alerts.append(f"🔴 **LIVE MTF SELL:** {', '.join(active_sells)}")
+        send_telegram_alert(f"🔴 *TACTICAL MTF SELL ALERT*\nInstruments: {', '.join(active_sells)}\nTimeframe: {timeframe} | Macro: {htf_tf.upper()}")
     st.success(" | ".join(alerts))
 else:
     st.info(f"🟡 **Pitch Clean:** No setups currently aligning with `{timeframe}` momentum + `{htf_tf.upper()}` macro direction.")
@@ -367,18 +361,15 @@ is_gold = "GC=F" in pair
 p_dec = 1 if is_crypto else (3 if is_jpy else 5)
 pip_scale = 1.0 if is_crypto else (0.01 if is_jpy else 0.0001)
 
-# Defensive Stop Computation (Structural vs ATR)
+# Defensive Stop Computation
 if "Structural" in stop_model and len(df) >= 6:
     swing_low = df['Low'].iloc[-6:-1].min()
     swing_high = df['High'].iloc[-6:-1].max()
     buffer_amt = latest['ATR_14'] * 0.3
     
-    # Calculate for Long
     raw_dist_long = (latest['Close'] - (swing_low - buffer_amt))
-    # Calculate for Short
     raw_dist_short = ((swing_high + buffer_amt) - latest['Close'])
     
-    # Base stop distance on active possession
     stop_distance_price = max(raw_dist_long if latest['Close'] > latest['Midfield_200EMA'] else raw_dist_short, 8.0 * pip_scale)
 else:
     stop_distance_price = max(latest['ATR_14'] * 1.5, 8.0 * pip_scale if not is_crypto else latest['ATR_14'] * 1.5)
@@ -439,7 +430,7 @@ c3.metric(f"Defensive Stop", f"{stop_metric:.1f} {metric_label}", f"Target: +{st
 c4.metric(f"Strict Size ({risk_pct*100:.1f}% Risk)", sizing_label, f"Req Margin: ${required_margin:,.2f}")
 
 # =========================================================
-# 7. Restored Active Directive Box (Buy/Sell, Entry, SL, TP)
+# 7. Active Directive Box (Buy/Sell, Entry, SL, TP)
 # =========================================================
 active_buy = bool(latest['Striker_Buy'])
 active_sell = bool(latest['Striker_Sell'])
@@ -473,7 +464,7 @@ else:
     status_reason = f"Macro {htf_tf.upper()} is {'Bullish' if htf_is_bull else 'Bearish'}. Waiting for pullbacks to the 20 EMA." if use_htf else "Scanning for structure touch."
     st.info(f"""
     ### 🟡 TACTICAL DIRECTIVE: STAND BY (PATIENT POSSESSION)
-    * **Status:** No qualified setup on `{timeframe}` pitch. ADX: `{latest['ADX']:.1f}` (Requires $\ge$ {adx_min}).
+    * **Status:** No qualified setup on `{timeframe}` pitch. ADX: `{latest['ADX']:.1f}` (Requires  {adx_min}).
     * **Market Session:** {session_name} ({'Active' if session_ok else 'Low Volume'}).
     * **Alignment:** {status_reason}
     """)
@@ -667,3 +658,5 @@ if not perf_df.empty:
         st.dataframe(perf_df.drop(columns=['r_numeric']).iloc[::-1], use_container_width=True, hide_index=True)
 else:
     st.info(f"No setups triggered during active liquidity windows meeting LTF + {htf_tf.upper()} alignment.")
+
+
