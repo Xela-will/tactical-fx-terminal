@@ -25,6 +25,7 @@ GLOBAL_ALERT_CACHE = {}
 def send_telegram_alert(message, alert_key=None):
     bot_token = "9147061627:AAHW0mNPH13a-MNBquysnPceFR7WMKv1Pfw"
     chat_id = "7108814293"
+    chat_id = "@tempolabs_feed"
     
     # Cooldown verification
     if alert_key:
