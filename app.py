@@ -7,7 +7,18 @@ from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 import pytz
+import requests
 import os
+
+def send_telegram_alert(message):
+    bot_token = "9147061627:AAHW0mNPH13a-MNBquysnPceFR7WMKv1Pfw"
+    chat_id = "7108814293"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception:
+        pass
 
 # =========================================================
 # 1. Page Configuration & Custom Tactical Theme
@@ -167,6 +178,16 @@ def process_mtf_indicators(df_ltf, df_htf, enforce_htf):
         df_htf['HTF_Bull'] = (df_htf['Close'] > df_htf['HTF_50EMA']).astype(int)
         df_htf['HTF_Bear'] = (df_htf['Close'] < df_htf['HTF_50EMA']).astype(int)
 
+if active_buys or active_sells:
+    alerts = []
+    if active_buys: 
+        alerts.append(f"🟢 **LIVE MTF BUY:** {', '.join(active_buys)}")
+        send_telegram_alert(f"🟢 *TACTICAL MTF BUY ALERT*\nInstruments: {', '.join(active_buys)}\nTimeframe: {timeframe} | Macro: {htf_tf.upper()}")
+    if active_sells: 
+        alerts.append(f"🔴 **LIVE MTF SELL:** {', '.join(active_sells)}")
+        send_telegram_alert(f"🔴 *TACTICAL MTF SELL ALERT*\nInstruments: {', '.join(active_sells)}\nTimeframe: {timeframe} | Macro: {htf_tf.upper()}")
+    st.success(" | ".join(alerts))
+        
         htf_shifted = df_htf[['HTF_50EMA', 'HTF_Bull', 'HTF_Bear']].shift(1)
 
         try:
